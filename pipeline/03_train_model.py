@@ -6,8 +6,8 @@
 # MAGIC - **Stage 1** — a binary LightGBM classifier predicts `P(quantite = 0)`.
 # MAGIC - **Stage 2** — a LightGBM regressor (trained only on rows where
 # MAGIC   `quantite > 0`) predicts the expected quantity *conditional* on being
-# MAGIC   non-zero, using `log1p(quantite)` as the target.
-# MAGIC - At scoring time: `pred = 0 if p_zero > threshold else expm1(reg_pred)`.
+# MAGIC   non-zero, using raw `quantite` as the target with MAE loss (regression_l1).
+# MAGIC - At scoring time: `pred = 0 if p_zero > threshold else reg_pred`.
 # MAGIC - The threshold is tuned on the validation set to minimise WAPE.
 # MAGIC
 # MAGIC **Inputs:** `workspace.default.feature_table`.
@@ -39,6 +39,7 @@ import pandas as pd
 import lightgbm as lgb
 import mlflow
 import mlflow.lightgbm
+from mlflow.models import infer_signature
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType, DoubleType, StringType, StructField, StructType
 
@@ -143,7 +144,13 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         )
         mlflow.log_metric("val_logloss", val_logloss)
         mlflow.log_param("best_iteration_zero", model_zero.best_iteration)
-        mlflow.lightgbm.log_model(model_zero, artifact_path="zero_classifier", registered_model_name=MLFLOW_MODEL_NAME_ZERO)
+        # Cast category cols to int for signature/input_example (MLflow can't serialize category dtype)
+        X_tr_clean = X_tr.head(5).copy()
+        for c in FEATURES_CATEGORICAL:
+            if c in X_tr_clean.columns:
+                X_tr_clean[c] = X_tr_clean[c].astype(int)
+        sig_zero = infer_signature(X_tr_clean, model_zero.predict(X_tr.head(5)))
+        mlflow.lightgbm.log_model(model_zero, artifact_path="zero_classifier", registered_model_name=MLFLOW_MODEL_NAME_ZERO, signature=sig_zero, input_example=X_tr_clean.head(1))
 
         fi_zero = pd.DataFrame({
             "feature": FEATURES,
@@ -152,43 +159,39 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         fi_zero.to_csv("/tmp/fi_zero.csv", index=False)
         mlflow.log_artifact("/tmp/fi_zero.csv")
 
-    # -------- Stage 2 --------
+    # -------- Stage 2 — MAE on raw quantite (WAPE-aligned) --------
     with mlflow.start_run(run_name="stage2_qty_regressor", nested=True) as r2:
-        # Train only on rows where quantite > 0. Target is log1p for stability
-        # on the heavy-tailed distribution (max 21 646 vs P99 = 179).
+        # Train only on rows where quantite > 0.
+        # Target is raw quantite (not log1p) — MAE on raw scale is
+        # equivalent to minimising WAPE since the denominator is constant.
         nz = y_tr > 0
         X_tr_nz = X_tr.loc[nz].reset_index(drop=True)
         y_tr_nz = y_tr[nz]
-        w_tr_nz = y_tr_nz.copy()   # sample weights ∝ quantite — match the WAPE weighting
 
-        y_tr_log = np.log1p(y_tr_nz)
+        y_tr_target = y_tr_nz
 
         # Validation: also restricted to non-zero rows, but we evaluate the
         # overall pipeline WAPE below on the full val set after combining.
         nz_va = y_va > 0
         X_va_nz = X_va.loc[nz_va].reset_index(drop=True)
         y_va_nz = y_va[nz_va]
-        y_va_log = np.log1p(y_va_nz)
-        w_va_nz = y_va_nz.copy()
+        y_va_target = y_va_nz
 
         dtrain_q = lgb.Dataset(
             X_tr_nz,
-            label=y_tr_log,
-            weight=w_tr_nz,
+            label=y_tr_target,
             categorical_feature=FEATURES_CATEGORICAL,
         )
         dval_q = lgb.Dataset(
             X_va_nz,
-            label=y_va_log,
-            weight=w_va_nz,
+            label=y_va_target,
             reference=dtrain_q,
             categorical_feature=FEATURES_CATEGORICAL,
         )
 
-        # Tweedie with log1p target is unusual — Tweedie expects the raw scale.
-        # Override the objective to regression_l2 on log1p for stage 2.
+        # regression_l1 = MAE. Unweighted MAE on raw scale aligns with WAPE.
         qty_params = dict(LGB_PARAMS_QTY)
-        qty_params["objective"] = "regression"
+        qty_params["objective"] = "regression_l1"
         qty_params["metric"] = "None"
 
         model_qty = lgb.train(
@@ -205,7 +208,13 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         )
 
         mlflow.log_param("best_iteration_qty", model_qty.best_iteration)
-        mlflow.lightgbm.log_model(model_qty, artifact_path="qty_regressor", registered_model_name=MLFLOW_MODEL_NAME_QTY)
+        # Cast category cols to int for signature/input_example
+        X_nz_clean = X_tr_nz.head(5).copy()
+        for c in FEATURES_CATEGORICAL:
+            if c in X_nz_clean.columns:
+                X_nz_clean[c] = X_nz_clean[c].astype(int)
+        sig_qty = infer_signature(X_nz_clean, model_qty.predict(X_tr_nz.head(5)))
+        mlflow.lightgbm.log_model(model_qty, artifact_path="qty_regressor", registered_model_name=MLFLOW_MODEL_NAME_QTY, signature=sig_qty, input_example=X_nz_clean.head(1))
 
         fi_qty = pd.DataFrame({
             "feature": FEATURES,
@@ -216,10 +225,9 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
 
     # -------- Combine on the full val set and sweep threshold --------
     # Predict the quantity on *all* val rows (even those where p_zero is high)
-    # — the gate is applied after.
-    qty_pred_log = model_qty.predict(X_va, num_iteration=model_qty.best_iteration)
-    qty_pred = np.expm1(qty_pred_log)
-    qty_pred = np.clip(qty_pred, 0.0, None)
+    # — the gate is applied after. Predictions are already in raw scale.
+    qty_pred_raw = model_qty.predict(X_va, num_iteration=model_qty.best_iteration)
+    qty_pred = np.clip(qty_pred_raw, 0.0, None)
 
     best_threshold = None
     best_wape = float("inf")

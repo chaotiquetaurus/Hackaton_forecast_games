@@ -21,7 +21,7 @@
 # -----------------------------------------------------------------------------
 # Team identity & submission table
 # -----------------------------------------------------------------------------
-NOM_EQUIPE = "telecacaton"
+NOM_EQUIPE = "télécacaton"
 TABLE_PREDICTIONS = f"workspace.default.predictions_equipe_{NOM_EQUIPE}"
 
 # -----------------------------------------------------------------------------
@@ -66,8 +66,8 @@ TEST_END_WEEK_ID = 202552
 # MLflow experiment
 # -----------------------------------------------------------------------------
 MLFLOW_EXPERIMENT = f"/Shared/sgdb2026_{NOM_EQUIPE}"
-MLFLOW_MODEL_NAME_ZERO = f"sgdb2026_{NOM_EQUIPE}_zero_classifier"
-MLFLOW_MODEL_NAME_QTY = f"sgdb2026_{NOM_EQUIPE}_quantity_regressor"
+MLFLOW_MODEL_NAME_ZERO = f"workspace.default.sgdb2026_{NOM_EQUIPE}_zero_classifier"
+MLFLOW_MODEL_NAME_QTY = f"workspace.default.sgdb2026_{NOM_EQUIPE}_quantity_regressor"
 
 # -----------------------------------------------------------------------------
 # Reproducibility

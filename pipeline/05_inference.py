@@ -157,8 +157,8 @@ for c in FEATURES_CATEGORICAL:
         X_test[c] = X_test[c].astype("category")
 
 p_zero = model_zero.predict(X_test, num_iteration=model_zero.best_iteration)
-qty_log = model_qty.predict(X_test, num_iteration=model_qty.best_iteration)
-qty = np.clip(np.expm1(qty_log), 0.0, None)
+qty_raw = model_qty.predict(X_test, num_iteration=model_qty.best_iteration)
+qty = np.clip(qty_raw, 0.0, None)
 
 final = np.where(p_zero > best_threshold, 0.0, qty)
 
@@ -198,16 +198,6 @@ out_sdf = (
 )
 print(f"Wrote {out_sdf.count():,} rows to {TBL_PREDICTIONS_FINAL}")
 
-# Also populate the hackathon submission table (same schema).
-(
-    out_sdf.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(TABLE_PREDICTIONS)
-)
-print(f"Mirrored into submission table {TABLE_PREDICTIONS}")
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -215,9 +205,8 @@ print(f"Mirrored into submission table {TABLE_PREDICTIONS}")
 
 # COMMAND ----------
 
-csv_path = "/dbfs/FileStore/sgdb2026_submission.csv"
-out_df.to_csv(csv_path, index=False)
-print(f"CSV written to {csv_path}")
+print("Predictions already saved to Delta table — CSV export skipped (DBFS not available on serverless).")
+print(f"Query your predictions with: SELECT * FROM {TBL_PREDICTIONS_FINAL}")
 
 # COMMAND ----------
 
@@ -228,3 +217,8 @@ with mlflow.start_run(run_name="inference"):
     mlflow.log_metric("n_test_rows", len(out_df))
     mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
     mlflow.log_metric("mean_pred", float(final_int.mean()))
+
+# COMMAND ----------
+
+out_sdf.write.mode("overwrite").saveAsTable(f"workspace.default.`predictions_equipe_{NOM_EQUIPE}`")
+print(f"Submitted to leaderboard: workspace.default.predictions_equipe_{NOM_EQUIPE}")

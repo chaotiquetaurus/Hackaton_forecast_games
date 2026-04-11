@@ -163,7 +163,7 @@ def train_lgb_classifier(X_tr_, z_tr_, X_va_, z_va_, seed: int):
         valid_sets=[dva], valid_names=["val"],
         callbacks=[
             lgb.early_stopping(LGB_EARLY_STOP_ZERO, first_metric_only=True),
-            lgb.log_evaluation(period=200),
+            lgb.log_evaluation(period=50),
         ],
     )
 
@@ -194,7 +194,7 @@ def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
         feval=wape_lgb_feval,
         callbacks=[
             lgb.early_stopping(LGB_EARLY_STOP_QTY, first_metric_only=True),
-            lgb.log_evaluation(period=200),
+            lgb.log_evaluation(period=50),
         ],
     )
 
@@ -210,7 +210,7 @@ def train_xgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
         num_boost_round=XGB_NUM_ROUNDS_QTY,
         evals=[(dva, "val")],
         early_stopping_rounds=XGB_EARLY_STOP_QTY,
-        verbose_eval=200,
+        verbose_eval=50,
     )
 
 
@@ -288,31 +288,49 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
     )
     mlflow.log_metric("val_logloss_clf", val_logloss)
 
+    # ─── Hurdle subset: the regressors train only on rows where y > 0 ──────
+    # This is the architecture that scored 0.87 on val before the rewrite.
+    # Tweedie-on-all-rows was the Fourth-good-model choice, but that notebook
+    # relies on streak_zeros / momentum / EWMA features that we don't have —
+    # without them, Tweedie over-predicts on true-zero rows and val WAPE
+    # blows up to ~1.06. Restricting to non-zero rows delegates the zero
+    # decision entirely to the classifier (proper hurdle model).
+    nz_tr = y_tr > 0
+    nz_va = y_va > 0
+    X_tr_nz = X_tr.loc[nz_tr].reset_index(drop=True)
+    y_tr_nz = y_tr[nz_tr]
+    X_va_nz = X_va.loc[nz_va].reset_index(drop=True)
+    y_va_nz = y_va[nz_va]
+    print(f"Hurdle subsets: train non-zero {len(X_tr_nz):,}/{len(X_tr):,}  "
+          f"val non-zero {len(X_va_nz):,}/{len(X_va):,}")
+
     # ─────────────────── Stage 2a — LightGBM Tweedie regressor ─────────────
     print("=" * 60)
-    print("STAGE 2a — LightGBM Tweedie regressor")
+    print("STAGE 2a — LightGBM Tweedie regressor (hurdle: non-zero only)")
     print("=" * 60)
 
     lgb_reg_models = []
     lgb_reg_val_preds = []
     for seed in ENSEMBLE_SEEDS:
         print(f"  seed={seed}")
-        m = train_lgb_regressor(X_tr, y_tr, X_va, y_va, seed)
+        m = train_lgb_regressor(X_tr_nz, y_tr_nz, X_va_nz, y_va_nz, seed)
         lgb_reg_models.append(m)
+        # Predict on the FULL val — the stacker + classifier gate operate
+        # row-by-row and need a regressor output for every row.
         lgb_reg_val_preds.append(predict_lgb(m, X_va))
     lgb_val_avg = np.mean(np.stack(lgb_reg_val_preds, axis=0), axis=0)
     mlflow.log_metric("val_wape_lgb_only", wape_numpy(y_va, lgb_val_avg))
 
     # ─────────────────── Stage 2b — XGBoost Tweedie regressor ──────────────
     print("=" * 60)
-    print("STAGE 2b — XGBoost Tweedie regressor")
+    print("STAGE 2b — XGBoost Tweedie regressor (hurdle: non-zero only)")
     print("=" * 60)
 
     xgb_reg_models = []
     xgb_reg_val_preds = []
     for seed in ENSEMBLE_SEEDS:
         print(f"  seed={seed}")
-        m = train_xgb_regressor(X_tr, y_tr, X_va, y_va, seed)
+        m = train_xgb_regressor(X_tr_nz, y_tr_nz, X_va_nz, y_va_nz, seed)
         xgb_reg_models.append(m)
         xgb_reg_val_preds.append(predict_xgb(m, X_va))
     xgb_val_avg = np.mean(np.stack(xgb_reg_val_preds, axis=0), axis=0)
@@ -348,11 +366,21 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
             Xf_va = X_tr_sorted.iloc[va_idx]
             yf_va = y_tr_sorted[va_idx]
 
-            m_lgb_f = train_lgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed)
+            # Hurdle: train each fold on the non-zero subset, evaluate
+            # early-stopping on non-zero fold_val too. Predict on the FULL
+            # fold_val so oof_lgb_s / oof_xgb_s cover every row.
+            nz_f_tr = yf_tr > 0
+            nz_f_va = yf_va > 0
+            Xf_tr_nz = Xf_tr.loc[nz_f_tr].reset_index(drop=True)
+            yf_tr_nz = yf_tr[nz_f_tr]
+            Xf_va_nz = Xf_va.loc[nz_f_va].reset_index(drop=True)
+            yf_va_nz = yf_va[nz_f_va]
+
+            m_lgb_f = train_lgb_regressor(Xf_tr_nz, yf_tr_nz, Xf_va_nz, yf_va_nz, first_seed)
             oof_lgb_s[va_idx] = predict_lgb(m_lgb_f, Xf_va)
             del m_lgb_f; gc.collect()
 
-            m_xgb_f = train_xgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed)
+            m_xgb_f = train_xgb_regressor(Xf_tr_nz, yf_tr_nz, Xf_va_nz, yf_va_nz, first_seed)
             oof_xgb_s[va_idx] = predict_xgb(m_xgb_f, Xf_va)
             del m_xgb_f; gc.collect()
 
@@ -361,21 +389,30 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         oof_xgb = oof_xgb_s[inv_order]
         oof_mask = ~np.isnan(oof_lgb)
 
+        # Fit Ridge only on non-zero training rows — the regressor predictions
+        # on zero rows are "what the quantity would be if non-zero" (large),
+        # and forcing Ridge to map them to y=0 would distort the weights.
+        fit_mask = oof_mask & (y_tr > 0)
         bl_tr = baseline_matrix(train_pd)
         stack_fit_X = np.column_stack([
-            oof_lgb[oof_mask],
-            oof_xgb[oof_mask],
-            bl_tr[oof_mask],
+            oof_lgb[fit_mask],
+            oof_xgb[fit_mask],
+            bl_tr[fit_mask],
         ])
-        stack_fit_y = y_tr[oof_mask]
+        stack_fit_y = y_tr[fit_mask]
         stacker.fit(stack_fit_X, stack_fit_y)
-        stack_fit_source = f"oof_train (n={oof_mask.sum()}/{len(y_tr)})"
+        stack_fit_source = f"oof_train_nonzero (n={fit_mask.sum()}/{len(y_tr)})"
     else:
         print("  Fitting Ridge on validation predictions (STACKING_OOF_FOLDS < 2)")
+        nz_va_fit = y_va > 0
         bl_va_fit = baseline_matrix(val_pd)
-        stack_fit_X = np.column_stack([lgb_val_avg, xgb_val_avg, bl_va_fit])
-        stacker.fit(stack_fit_X, y_va)
-        stack_fit_source = "val_predictions"
+        stack_fit_X = np.column_stack([
+            lgb_val_avg[nz_va_fit],
+            xgb_val_avg[nz_va_fit],
+            bl_va_fit[nz_va_fit],
+        ])
+        stacker.fit(stack_fit_X, y_va[nz_va_fit])
+        stack_fit_source = f"val_nonzero (n={int(nz_va_fit.sum())}/{len(y_va)})"
 
     coef = stacker.coef_
     stack_feature_names = ["lgb", "xgb"] + STACK_BASELINE_COLS

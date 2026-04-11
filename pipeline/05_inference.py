@@ -26,8 +26,10 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install lightgbm==4.3.0 xgboost==2.0.3
+# MAGIC %pip install lightgbm==4.5.0 xgboost==2.1.3
 # MAGIC dbutils.library.restartPython()
+# MAGIC # Same NumPy 2.0 compat pins as 03_train_model.py — must match so that
+# MAGIC # the saved boosters load cleanly.
 
 # COMMAND ----------
 

@@ -41,8 +41,11 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install lightgbm==4.3.0 xgboost==2.0.3
+# MAGIC %pip install lightgbm==4.5.0 xgboost==2.1.3
 # MAGIC dbutils.library.restartPython()
+# MAGIC # NumPy 2.0 compat: xgboost<2.1 and lightgbm<4.4 reference np.NaN which
+# MAGIC # was removed in NumPy 2.0. These two versions are the first releases
+# MAGIC # with full NumPy 2.0 support.
 
 # COMMAND ----------
 

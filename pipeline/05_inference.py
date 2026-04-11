@@ -1,0 +1,230 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 05 — Inference
+# MAGIC
+# MAGIC Applies the two-stage model (pulled from the MLflow Model Registry)
+# MAGIC to the test period (2025-W27 .. 2025-W52) and writes the final
+# MAGIC predictions to Delta + a CSV for the hackathon submission.
+# MAGIC
+# MAGIC **Inputs:**
+# MAGIC - `workspace.default.feature_table` (already contains test rows with
+# MAGIC   features but `quantite = null`)
+# MAGIC - The latest versions of both registered models.
+# MAGIC - The best zero threshold, pulled from the latest `train_pipeline`
+# MAGIC   MLflow run.
+# MAGIC
+# MAGIC **Outputs:**
+# MAGIC - `workspace.default.predictions_final` — Delta table with columns
+# MAGIC   (semaine, code_agence, code_article, quantite).
+# MAGIC - The hackathon submission table `predictions_equipe_<team>`
+# MAGIC   (overwritten with the same contents).
+# MAGIC - A CSV file in `/dbfs/FileStore/sgdb2026_submission.csv`.
+# MAGIC
+# MAGIC **Lag handling at inference:** lags 1..25 are not available when
+# MAGIC predicting W27..W52 because they would require target values from
+# MAGIC inside the prediction window. We impute them with the pair's
+# MAGIC expanding mean (`pair_mean`, itself safe), which is the same fallback
+# MAGIC LightGBM would pick with missing-value splits anyway — being explicit
+# MAGIC about it makes the behaviour reproducible.
+
+# COMMAND ----------
+
+# MAGIC %run ./00_config
+
+# COMMAND ----------
+
+# MAGIC %pip install lightgbm==4.3.0
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# MAGIC %run ./00_config
+
+# COMMAND ----------
+
+import sys
+sys.path.append("./")
+
+import numpy as np
+import pandas as pd
+import mlflow
+import mlflow.lightgbm
+from pyspark.sql import functions as F
+from pyspark.sql.types import LongType
+
+# COMMAND ----------
+
+mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1. Load the tuned threshold from the latest training run
+
+# COMMAND ----------
+
+runs = mlflow.search_runs(
+    experiment_names=[MLFLOW_EXPERIMENT],
+    filter_string="tags.mlflow.runName = 'train_pipeline'",
+    order_by=["start_time DESC"],
+    max_results=1,
+)
+if len(runs) == 0:
+    raise RuntimeError("No train_pipeline run found; run 03_train_model.py first.")
+
+best_threshold = float(runs.iloc[0]["params.best_zero_threshold"])
+print(f"Zero threshold: {best_threshold}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Load both models from the registry
+
+# COMMAND ----------
+
+client = mlflow.tracking.MlflowClient()
+
+def _latest_version(name: str) -> str:
+    versions = client.search_model_versions(f"name='{name}'")
+    if not versions:
+        raise RuntimeError(f"No version found for model {name}")
+    return str(max(int(v.version) for v in versions))
+
+v_zero = _latest_version(MLFLOW_MODEL_NAME_ZERO)
+v_qty = _latest_version(MLFLOW_MODEL_NAME_QTY)
+
+model_zero = mlflow.lightgbm.load_model(f"models:/{MLFLOW_MODEL_NAME_ZERO}/{v_zero}")
+model_qty = mlflow.lightgbm.load_model(f"models:/{MLFLOW_MODEL_NAME_QTY}/{v_qty}")
+
+print(f"Loaded zero_classifier v{v_zero}, qty_regressor v{v_qty}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Pull the feature rows for the test period
+# MAGIC
+# MAGIC The Lakeflow pipeline already materialises `gold_test_features` with
+# MAGIC exactly the test period (2025-W27..W52) and the same features as
+# MAGIC `gold_train` / `gold_validation`. We just project and ship to pandas.
+
+# COMMAND ----------
+
+feature_cols = ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"] + FEATURES
+
+test_features_sdf = spark.table(TBL_GOLD_TEST).select(*feature_cols)
+
+test_df = test_features_sdf.toPandas()
+print(f"Test rows: {len(test_df):,}   (expected 272 344)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Impute short-range lags with pair expanding mean
+
+# COMMAND ----------
+
+# Lags 1..25 will be null because the target is missing for test rows and
+# all the weeks in-between also have null targets. We fall back on pair_mean,
+# which is an expanding statistic computed from training history only.
+short_lags = [c for c in FEATURES if c.startswith("lag_") and int(c.split("_")[1]) < 26]
+for c in short_lags:
+    test_df[c] = test_df[c].fillna(test_df["pair_mean"])
+
+# Rolling stats with windows shorter than 26 weeks suffer the same issue.
+# Impute their nulls with the matching long-horizon value.
+for short, long in [
+    ("roll_mean_4", "roll_mean_26"),
+    ("roll_mean_8", "roll_mean_26"),
+    ("roll_mean_13", "roll_mean_26"),
+    ("roll_std_4", "roll_std_26"),
+    ("roll_std_8", "roll_std_26"),
+    ("roll_std_13", "roll_std_26"),
+    ("roll_median_4", "roll_median_13"),
+]:
+    if short in test_df.columns and long in test_df.columns:
+        test_df[short] = test_df[short].fillna(test_df[long])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Score both stages and combine
+
+# COMMAND ----------
+
+X_test = test_df[FEATURES].copy()
+for c in FEATURES_CATEGORICAL:
+    if c in X_test.columns:
+        X_test[c] = X_test[c].astype("category")
+
+p_zero = model_zero.predict(X_test, num_iteration=model_zero.best_iteration)
+qty_log = model_qty.predict(X_test, num_iteration=model_qty.best_iteration)
+qty = np.clip(np.expm1(qty_log), 0.0, None)
+
+final = np.where(p_zero > best_threshold, 0.0, qty)
+
+# Dead pairs are forced to zero regardless — no reason to believe they will
+# suddenly come back to life in W27..W52.
+final = np.where(test_df["is_dead_pair"].values == 1, 0.0, final)
+
+# Round to non-negative integers — the submission format expects LongType.
+final_int = np.clip(np.round(final), 0, None).astype(np.int64)
+
+print(f"Predictions > 0: {(final_int > 0).sum():,}  /  total: {len(final_int):,}")
+print(f"Mean predicted : {final_int.mean():.3f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Write final predictions
+
+# COMMAND ----------
+
+out_df = test_df[["semaine", "code_agence", "code_article"]].copy()
+out_df["quantite"] = final_int
+
+out_sdf = (
+    spark.createDataFrame(out_df)
+    .withColumn("code_agence", F.col("code_agence").cast(LongType()))
+    .withColumn("code_article", F.col("code_article").cast(LongType()))
+    .withColumn("quantite", F.col("quantite").cast(LongType()))
+)
+
+(
+    out_sdf.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TBL_PREDICTIONS_FINAL)
+)
+print(f"Wrote {out_sdf.count():,} rows to {TBL_PREDICTIONS_FINAL}")
+
+# Also populate the hackathon submission table (same schema).
+(
+    out_sdf.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TABLE_PREDICTIONS)
+)
+print(f"Mirrored into submission table {TABLE_PREDICTIONS}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. CSV export for manual submission
+
+# COMMAND ----------
+
+csv_path = "/dbfs/FileStore/sgdb2026_submission.csv"
+out_df.to_csv(csv_path, index=False)
+print(f"CSV written to {csv_path}")
+
+# COMMAND ----------
+
+with mlflow.start_run(run_name="inference"):
+    mlflow.log_param("zero_threshold", best_threshold)
+    mlflow.log_param("zero_clf_version", v_zero)
+    mlflow.log_param("qty_reg_version", v_qty)
+    mlflow.log_metric("n_test_rows", len(out_df))
+    mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
+    mlflow.log_metric("mean_pred", float(final_int.mean()))

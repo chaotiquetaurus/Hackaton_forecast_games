@@ -1,31 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 05 — Inference
+# MAGIC # 05 - Inference
 # MAGIC
-# MAGIC Applies the two-stage model (pulled from the MLflow Model Registry)
-# MAGIC to the test period (2025-W27 .. 2025-W52) and writes the final
-# MAGIC predictions to Delta + a CSV for the hackathon submission.
-# MAGIC
-# MAGIC **Inputs:**
-# MAGIC - `workspace.default.feature_table` (already contains test rows with
-# MAGIC   features but `quantite = null`)
-# MAGIC - The latest versions of both registered models.
-# MAGIC - The best zero threshold, pulled from the latest `train_pipeline`
-# MAGIC   MLflow run.
-# MAGIC
-# MAGIC **Outputs:**
-# MAGIC - `workspace.default.predictions_final` — Delta table with columns
-# MAGIC   (semaine, code_agence, code_article, quantite).
-# MAGIC - The hackathon submission table `predictions_equipe_<team>`
-# MAGIC   (overwritten with the same contents).
-# MAGIC - A CSV file in `/dbfs/FileStore/sgdb2026_submission.csv`.
-# MAGIC
-# MAGIC **Lag handling at inference:** lags 1..25 are not available when
-# MAGIC predicting W27..W52 because they would require target values from
-# MAGIC inside the prediction window. We impute them with the pair's
-# MAGIC expanding mean (`pair_mean`, itself safe), which is the same fallback
-# MAGIC LightGBM would pick with missing-value splits anyway — being explicit
-# MAGIC about it makes the behaviour reproducible.
+# MAGIC Loads the latest registered two-stage LightGBM models, reads the exact
+# MAGIC feature list expected by the boosters, scores 2025-W27..W52, and writes
+# MAGIC fresh predictions to Delta.
 
 # COMMAND ----------
 
@@ -42,24 +21,20 @@
 
 # COMMAND ----------
 
+import os
 import sys
+
 sys.path.append("./")
 
-import numpy as np
-import pandas as pd
 import mlflow
 import mlflow.lightgbm
-from pyspark.sql import functions as F
-from pyspark.sql.types import LongType
+import numpy as np
+import pandas as pd
+from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 # COMMAND ----------
 
 mlflow.set_experiment(MLFLOW_EXPERIMENT)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1. Load the tuned threshold from the latest training run
 
 # COMMAND ----------
 
@@ -77,140 +52,154 @@ print(f"Zero threshold: {best_threshold}")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 2. Load both models from the registry
-
-# COMMAND ----------
-
 client = mlflow.tracking.MlflowClient()
 
-def _latest_version(name: str) -> str:
+
+def latest_version(name: str) -> str:
     versions = client.search_model_versions(f"name='{name}'")
     if not versions:
         raise RuntimeError(f"No version found for model {name}")
     return str(max(int(v.version) for v in versions))
 
-v_zero = _latest_version(MLFLOW_MODEL_NAME_ZERO)
-v_qty = _latest_version(MLFLOW_MODEL_NAME_QTY)
+
+def best_iteration(model):
+    iteration = getattr(model, "best_iteration", None)
+    if iteration is None or iteration <= 0:
+        return None
+    return iteration
+
+
+v_zero = latest_version(MLFLOW_MODEL_NAME_ZERO)
+v_qty = latest_version(MLFLOW_MODEL_NAME_QTY)
 
 model_zero = mlflow.lightgbm.load_model(f"models:/{MLFLOW_MODEL_NAME_ZERO}/{v_zero}")
 model_qty = mlflow.lightgbm.load_model(f"models:/{MLFLOW_MODEL_NAME_QTY}/{v_qty}")
 
+model_features = list(model_zero.feature_name())
+qty_features = list(model_qty.feature_name())
+if model_features != qty_features:
+    raise RuntimeError("Zero classifier and quantity regressor do not use the same feature list.")
+
+selected_cat_features = [c for c in FEATURES_CATEGORICAL if c in model_features]
 print(f"Loaded zero_classifier v{v_zero}, qty_regressor v{v_qty}")
+print(f"Model expects {len(model_features)} features ({len(selected_cat_features)} categorical).")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 3. Pull the feature rows for the test period
-# MAGIC
-# MAGIC The Lakeflow pipeline already materialises `gold_test_features` with
-# MAGIC exactly the test period (2025-W27..W52) and the same features as
-# MAGIC `gold_train` / `gold_validation`. We just project and ship to pandas.
+test_sdf = spark.table(TBL_GOLD_TEST)
+metadata_cols = ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"]
+fallback_cols = [
+    "pair_mean_lag26", "pair_median_lag26", "pair_mean",
+    "band_mean_26_52", "band_std_26_52", "band_min_26_52",
+    "band_max_26_52", "band_zero_rate_26_52",
+    "band_active_count_26_52", "band_nonzero_mean_26_52",
+    "band_cv_26_52",
+]
+extra_cols = [c for c in fallback_cols if c in test_sdf.columns and c not in model_features]
+needed_cols = metadata_cols + model_features + extra_cols
+missing = [c for c in needed_cols if c not in test_sdf.columns]
+if missing:
+    raise RuntimeError(f"gold_test_features is missing columns required for inference: {missing[:20]}")
+
+test_df = test_sdf.select(*needed_cols).toPandas()
+print(f"Test rows: {len(test_df):,}")
 
 # COMMAND ----------
 
-feature_cols = ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"] + FEATURES
+def fill_from_candidates(df: pd.DataFrame, col: str, candidates):
+    if col not in df.columns or not df[col].isna().any():
+        return
+    for candidate in candidates:
+        if candidate in df.columns:
+            df[col] = df[col].fillna(df[candidate])
+            if not df[col].isna().any():
+                break
 
-test_features_sdf = spark.table(TBL_GOLD_TEST).select(*feature_cols)
 
-test_df = test_features_sdf.toPandas()
-print(f"Test rows: {len(test_df):,}   (expected 272 344)")
+# Defensive fallbacks for old selected models that may still contain short-lag
+# or rolling columns. The new selector should mostly avoid them.
+for c in model_features:
+    if c.startswith("lag_"):
+        lag_n = int(c.split("_")[1])
+        if lag_n < 26:
+            fill_from_candidates(test_df, c, ["pair_mean_lag26", "pair_mean", "band_mean_26_52"])
+    elif c.startswith("roll_mean_"):
+        fill_from_candidates(test_df, c, ["band_mean_26_52", "pair_mean_lag26", "pair_mean"])
+    elif c.startswith("roll_median_"):
+        fill_from_candidates(test_df, c, ["pair_median_lag26", "pair_mean_lag26", "pair_mean"])
+    elif c.startswith("roll_std_"):
+        fill_from_candidates(test_df, c, ["band_std_26_52"])
+    elif c.startswith("roll_min_"):
+        fill_from_candidates(test_df, c, ["band_min_26_52"])
+    elif c.startswith("roll_max_"):
+        fill_from_candidates(test_df, c, ["band_max_26_52"])
+    elif c.startswith("roll_sum_"):
+        fill_from_candidates(test_df, c, ["band_mean_26_52", "pair_mean_lag26", "pair_mean"])
+    elif c.startswith("roll_zero_rate_"):
+        fill_from_candidates(test_df, c, ["band_zero_rate_26_52"])
+    elif c.startswith("roll_active_count_"):
+        fill_from_candidates(test_df, c, ["band_active_count_26_52"])
+    elif c.startswith("roll_nonzero_mean_"):
+        fill_from_candidates(test_df, c, ["band_nonzero_mean_26_52", "pair_mean_lag26", "pair_mean"])
+    elif c.startswith("roll_cv_"):
+        fill_from_candidates(test_df, c, ["band_cv_26_52"])
+
+X_test = test_df.loc[:, model_features].copy()
+for c in model_features:
+    if c in selected_cat_features:
+        X_test[c] = pd.to_numeric(X_test[c], errors="coerce").fillna(-1).astype(np.int32)
+    else:
+        X_test[c] = pd.to_numeric(X_test[c], errors="coerce").astype(np.float32)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 4. Impute short-range lags with pair expanding mean
-
-# COMMAND ----------
-
-# Lags 1..25 will be null because the target is missing for test rows and
-# all the weeks in-between also have null targets. We fall back on pair_mean,
-# which is an expanding statistic computed from training history only.
-short_lags = [c for c in FEATURES if c.startswith("lag_") and int(c.split("_")[1]) < 26]
-for c in short_lags:
-    test_df[c] = test_df[c].fillna(test_df["pair_mean"])
-
-# Rolling stats with windows shorter than 26 weeks suffer the same issue.
-# Impute their nulls with the matching long-horizon value.
-for short, long in [
-    ("roll_mean_4", "roll_mean_26"),
-    ("roll_mean_8", "roll_mean_26"),
-    ("roll_mean_13", "roll_mean_26"),
-    ("roll_std_4", "roll_std_26"),
-    ("roll_std_8", "roll_std_26"),
-    ("roll_std_13", "roll_std_26"),
-    ("roll_median_4", "roll_median_13"),
-]:
-    if short in test_df.columns and long in test_df.columns:
-        test_df[short] = test_df[short].fillna(test_df[long])
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Score both stages and combine
-
-# COMMAND ----------
-
-X_test = test_df[FEATURES].copy()
-for c in FEATURES_CATEGORICAL:
-    if c in X_test.columns:
-        X_test[c] = X_test[c].astype("category")
-
-p_zero = model_zero.predict(X_test, num_iteration=model_zero.best_iteration)
-qty_raw = model_qty.predict(X_test, num_iteration=model_qty.best_iteration)
+p_zero = model_zero.predict(X_test, num_iteration=best_iteration(model_zero))
+qty_raw = model_qty.predict(X_test, num_iteration=best_iteration(model_qty))
 qty = np.clip(qty_raw, 0.0, None)
 
 final = np.where(p_zero > best_threshold, 0.0, qty)
-
-# Dead pairs are forced to zero regardless — no reason to believe they will
-# suddenly come back to life in W27..W52.
-final = np.where(test_df["is_dead_pair"].values == 1, 0.0, final)
-
-# Round to non-negative integers — the submission format expects LongType.
+final = np.where(test_df["is_dead_pair"].fillna(0).astype(int).to_numpy() == 1, 0.0, final)
 final_int = np.clip(np.round(final), 0, None).astype(np.int64)
 
-print(f"Predictions > 0: {(final_int > 0).sum():,}  /  total: {len(final_int):,}")
+print(f"Predictions > 0: {(final_int > 0).sum():,} / {len(final_int):,}")
 print(f"Mean predicted : {final_int.mean():.3f}")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### eNZO Test
+out_df = test_df[["semaine", "code_agence", "code_article"]].copy()
+out_df["code_agence"] = pd.to_numeric(out_df["code_agence"], errors="coerce").astype(np.int64)
+out_df["code_article"] = pd.to_numeric(out_df["code_article"], errors="coerce").astype(np.int64)
+out_df["quantite"] = final_int
 
-# COMMAND ----------
+schema = StructType([
+    StructField("semaine", StringType()),
+    StructField("code_agence", LongType()),
+    StructField("code_article", LongType()),
+    StructField("quantite", LongType()),
+])
+out_sdf = spark.createDataFrame(out_df, schema=schema)
 
+(
+    out_sdf.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(TBL_PREDICTIONS_FINAL)
+)
+print(f"Wrote final predictions to {TBL_PREDICTIONS_FINAL}")
 
-NOM_EQUIPE = "telecacaton"   # ← remplacez par le nom de votre équipe
-
-# Ne touchez pas au reste
-TABLE_PREDICTIONS = f"workspace.default.predictions_equipe_{NOM_EQUIPE}"
-print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
-
-# COMMAND ----------
-
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6. Write final predictions
-
-# COMMAND ----------
-
-out_sdf = spark.table("workspace.default.predictions_final")
-print(f"{out_sdf.count():,} rows")
-display(out_sdf)
-print("Use the download button above to save as CSV")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 7. CSV export for manual submission
-
-# COMMAND ----------
-
-print("Predictions already saved to Delta table — CSV export skipped (DBFS not available on serverless).")
-print(f"Query your predictions with: SELECT * FROM {TABLE_PREDICTIONS}")
+try:
+    (
+        out_sdf.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(TABLE_PREDICTIONS)
+    )
+    print(f"Wrote submission table to {TABLE_PREDICTIONS}")
+except Exception as exc:
+    print(f"Could not write submission table {TABLE_PREDICTIONS}: {exc}")
+    print(f"Fallback table is available at {TBL_PREDICTIONS_FINAL}")
 
 # COMMAND ----------
 
@@ -218,11 +207,11 @@ with mlflow.start_run(run_name="inference"):
     mlflow.log_param("zero_threshold", best_threshold)
     mlflow.log_param("zero_clf_version", v_zero)
     mlflow.log_param("qty_reg_version", v_qty)
+    mlflow.log_param("n_model_features", len(model_features))
     mlflow.log_metric("n_test_rows", len(out_df))
     mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
     mlflow.log_metric("mean_pred", float(final_int.mean()))
 
 # COMMAND ----------
 
-# Leaderboard submission skipped — no permissions on predictions_equipe table
-print("Download the CSV from the table above instead.")
+display(out_sdf)

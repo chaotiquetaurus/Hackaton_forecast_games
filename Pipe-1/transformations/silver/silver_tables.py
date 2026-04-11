@@ -32,6 +32,24 @@ def _encode_column(df, src, dst):
     return df.join(dim, src, "left")
 
 
+def _numeric_or_null(df, src, dst):
+    """Cast a possibly string-backed numeric column to double, else null."""
+    if src not in df.columns:
+        return df.withColumn(dst, F.lit(None).cast("double"))
+    return df.withColumn(
+        dst,
+        F.regexp_replace(F.col(src).cast("string"), ",", ".").cast("double"),
+    )
+
+
+def _safe_div(num, den):
+    """Division helper that returns null for missing or zero denominators."""
+    return F.when(
+        den.isNull() | (den == 0),
+        F.lit(None).cast("double"),
+    ).otherwise(num / den)
+
+
 # ============================================================================
 # SILVER: cleaned, parsed, enriched
 # ============================================================================
@@ -155,7 +173,7 @@ def silver_ventes():
 
 @dp.materialized_view(
     name="silver_articles_encoded",
-    comment="Article reference with label-encoded specialite / famille / marque / mdd.",
+    comment="Article reference with richer label encodings and numeric descriptors.",
     table_properties={"quality": "silver"},
 )
 @dp.expect_or_fail("articles_unique_pair", "code_agence IS NOT NULL AND code_article IS NOT NULL")
@@ -165,19 +183,37 @@ def silver_articles_encoded():
     mapping = [
         ("specialite", "art_specialite_enc"),
         ("famille", "art_famille_enc"),
+        ("sous_famille", "art_sous_famille_enc"),
         ("marque", "art_marque_enc"),
         ("article_mdd", "art_mdd_enc"),
+        ("unite_vente", "art_unite_vente_enc"),
+        ("Gamme", "art_gamme_enc"),
+        ("code_fournisseur", "art_fournisseur_enc"),
     ]
     for src, dst in mapping:
         df = _encode_column(df, src, dst)
 
-    keep = ["code_agence", "code_article"] + [dst for _, dst in mapping]
+    df = _numeric_or_null(df, "Poids_en_kg", "art_poids_kg")
+    df = _numeric_or_null(df, "article_mdd", "art_mdd_num")
+    df = df.withColumn(
+        "art_log_poids_kg",
+        F.when(
+            F.col("art_poids_kg").isNull() | (F.col("art_poids_kg") < 0),
+            F.lit(None).cast("double"),
+        ).otherwise(F.log1p(F.col("art_poids_kg"))),
+    )
+
+    keep = (
+        ["code_agence", "code_article"]
+        + [dst for _, dst in mapping]
+        + ["art_poids_kg", "art_log_poids_kg", "art_mdd_num"]
+    )
     return df.select(*keep).dropDuplicates(["code_agence", "code_article"])
 
 
 @dp.materialized_view(
     name="silver_agences_encoded",
-    comment="Agency reference with label-encoded region.",
+    comment="Agency reference with geography encodings and coordinates.",
     table_properties={"quality": "silver"},
 )
 def silver_agences_encoded():
@@ -185,8 +221,27 @@ def silver_agences_encoded():
     # The raw column name is `region` in most builds of the hackathon data.
     src = "region" if "region" in df.columns else "ag_region"
     df = df.withColumnRenamed(src, "ag_region")
-    df = _encode_column(df, "ag_region", "ag_region_enc")
-    return df.select("code_agence", "ag_region_enc").dropDuplicates(["code_agence"])
+
+    mapping = [
+        ("ag_region", "ag_region_enc"),
+        ("departement", "ag_departement_enc"),
+        ("ville", "ag_ville_enc"),
+    ]
+    for src, dst in mapping:
+        df = _encode_column(df, src, dst)
+
+    df = _numeric_or_null(df, "latitude", "ag_latitude")
+    df = _numeric_or_null(df, "longitude", "ag_longitude")
+
+    keep = [
+        "code_agence",
+        "ag_region_enc",
+        "ag_departement_enc",
+        "ag_ville_enc",
+        "ag_latitude",
+        "ag_longitude",
+    ]
+    return df.select(*keep).dropDuplicates(["code_agence"])
 
 
 # ---------------------------------------------------------------------------
@@ -219,27 +274,65 @@ def silver_facturation_lagged():
         fac
         .withColumn("_annee", year_col.cast("int"))
         .withColumn("_mois", month_col.cast("int"))
+        .withColumn("_month_id", F.col("_annee") * F.lit(12) + F.col("_mois"))
         .groupBy("code_agence", "code_article", "_annee", "_mois")
         .agg(
-            F.sum(_pick("sum_montant", default=0.0)).alias("_sum_montant"),
-            F.sum(_pick("sum_quantite", default=0.0)).alias("_sum_quantite"),
+            F.sum(_pick("sum_montant", default=0.0)).alias("fac_sum_montant"),
+            F.sum(_pick("sum_quantite", default=0.0)).alias("fac_sum_quantite"),
+            F.min(_pick("min_quantite", default=0.0)).alias("fac_min_quantite"),
+            F.max(_pick("max_quantite", default=0.0)).alias("fac_max_quantite"),
             F.sum(_pick("nb_achats", default=0.0)).alias("fac_nb_achats"),
             F.sum(_pick("nb_achats_par_professionnels", default=0.0)).alias("_nb_pro"),
+            F.sum(_pick("nb_achats_par_particuliers", default=0.0)).alias("_nb_part"),
+            F.sum(_pick("nb_ventes_magasins", default=0.0)).alias("_nb_magasin"),
             F.sum(_pick("nb_chantiers", default=0.0)).alias("fac_nb_chantiers"),
         )
+        .withColumn("_month_id", F.col("_annee") * F.lit(12) + F.col("_mois"))
         .withColumn(
             "fac_prix_unit",
-            F.when(
-                (F.col("_sum_quantite").isNull()) | (F.col("_sum_quantite") == 0),
-                F.lit(None).cast("double"),
-            ).otherwise(F.col("_sum_montant") / F.col("_sum_quantite")),
+            _safe_div(F.col("fac_sum_montant"), F.col("fac_sum_quantite")),
         )
         .withColumn(
             "fac_pct_pro",
-            F.when(
-                (F.col("fac_nb_achats").isNull()) | (F.col("fac_nb_achats") == 0),
-                F.lit(None).cast("double"),
-            ).otherwise(F.col("_nb_pro") / F.col("fac_nb_achats")),
+            _safe_div(F.col("_nb_pro"), F.col("fac_nb_achats")),
+        )
+        .withColumn("fac_pct_particulier", _safe_div(F.col("_nb_part"), F.col("fac_nb_achats")))
+        .withColumn("fac_pct_magasin", _safe_div(F.col("_nb_magasin"), F.col("fac_nb_achats")))
+        .withColumn("fac_qty_per_achat", _safe_div(F.col("fac_sum_quantite"), F.col("fac_nb_achats")))
+        .withColumn("fac_montant_per_achat", _safe_div(F.col("fac_sum_montant"), F.col("fac_nb_achats")))
+        .withColumn("fac_chantiers_per_achat", _safe_div(F.col("fac_nb_chantiers"), F.col("fac_nb_achats")))
+        .withColumn("fac_montant_per_chantier", _safe_div(F.col("fac_sum_montant"), F.col("fac_nb_chantiers")))
+        .withColumn("fac_qty_per_chantier", _safe_div(F.col("fac_sum_quantite"), F.col("fac_nb_chantiers")))
+        .withColumn("fac_log_sum_quantite", F.log1p(F.greatest(F.col("fac_sum_quantite"), F.lit(0.0))))
+        .withColumn("fac_log_sum_montant", F.log1p(F.greatest(F.col("fac_sum_montant"), F.lit(0.0))))
+    )
+
+    month_w3 = (
+        Window.partitionBy("code_agence", "code_article")
+        .orderBy("_month_id")
+        .rowsBetween(-2, 0)
+    )
+    month_w6 = (
+        Window.partitionBy("code_agence", "code_article")
+        .orderBy("_month_id")
+        .rowsBetween(-5, 0)
+    )
+
+    monthly = (
+        monthly
+        .withColumn("fac_qty_roll3", F.sum("fac_sum_quantite").over(month_w3))
+        .withColumn("fac_qty_roll6", F.sum("fac_sum_quantite").over(month_w6))
+        .withColumn("fac_montant_roll3", F.sum("fac_sum_montant").over(month_w3))
+        .withColumn("fac_montant_roll6", F.sum("fac_sum_montant").over(month_w6))
+        .withColumn("fac_achats_roll6", F.sum("fac_nb_achats").over(month_w6))
+        .withColumn("_fac_pro_roll6", F.sum("_nb_pro").over(month_w6))
+        .withColumn(
+            "fac_prix_unit_roll6",
+            _safe_div(F.col("fac_montant_roll6"), F.col("fac_qty_roll6")),
+        )
+        .withColumn(
+            "fac_pct_pro_roll6",
+            _safe_div(F.col("_fac_pro_roll6"), F.col("fac_achats_roll6")),
         )
     )
 
@@ -264,8 +357,28 @@ def silver_facturation_lagged():
             "_join_mois",
             "fac_prix_unit",
             "fac_pct_pro",
+            "fac_pct_particulier",
+            "fac_pct_magasin",
             F.col("fac_nb_chantiers").cast("double"),
             F.col("fac_nb_achats").cast("double"),
+            F.col("fac_sum_quantite").cast("double"),
+            F.col("fac_sum_montant").cast("double"),
+            F.col("fac_min_quantite").cast("double"),
+            F.col("fac_max_quantite").cast("double"),
+            "fac_qty_per_achat",
+            "fac_montant_per_achat",
+            "fac_chantiers_per_achat",
+            "fac_montant_per_chantier",
+            "fac_qty_per_chantier",
+            "fac_log_sum_quantite",
+            "fac_log_sum_montant",
+            "fac_qty_roll3",
+            "fac_qty_roll6",
+            "fac_montant_roll3",
+            "fac_montant_roll6",
+            "fac_achats_roll6",
+            "fac_prix_unit_roll6",
+            "fac_pct_pro_roll6",
         )
     )
 

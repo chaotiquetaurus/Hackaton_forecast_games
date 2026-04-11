@@ -284,14 +284,20 @@ XGB_MIN_DELTA_QTY  = 1e-3
 STACK_BASELINE_COLS = ["lag_52", "pair_mean", "pair_median"]
 STACKING_RIDGE_ALPHA = 0.5
 
-# Out-of-fold predictions used to fit the Ridge safely.
-# - 0 (or 1)  → skip OOF, fit Ridge on validation preds directly (matches the
-#               notebook prototype; leakier but cheap).
-# - >= 2      → use TimeSeriesSplit with this many folds on the training set.
-#               Fit Ridge on OOF train predictions; this is the correct way
-#               to avoid over-fitting the stacker on validation.
-# Cost scales as ~n_folds × (LGB_reg + XGB_reg) for the first seed.
-STACKING_OOF_FOLDS = 3
+# Stacker fit strategy.
+#
+# - 0 (default) → fit Ridge on validation predictions from the main models.
+#                 This matches the Fourth-good-model notebook and is the
+#                 ROBUST choice when train spans multiple years with regime
+#                 shifts (2020-2024 here). Minimal overfit risk: 5 features
+#                 on ~85k non-zero rows.
+# - >= 2        → TimeSeriesSplit OOF on the training set (was the default
+#                 briefly). AVOID unless train is stationary: on this dataset,
+#                 OOF folds train on earlier, calmer periods and the fold
+#                 models under-predict vs the full-train model → Ridge learns
+#                 a 1.22x correction that then over-amplifies the main-model
+#                 predictions on val, blowing WAPE from ~0.80 to ~0.91.
+STACKING_OOF_FOLDS = 0
 
 # Isotonic calibration of the zero classifier. Fitted on validation probas
 # vs actual `is_zero`, applied at inference to stabilise the adaptive threshold.

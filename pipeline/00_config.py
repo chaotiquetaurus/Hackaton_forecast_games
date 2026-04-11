@@ -262,11 +262,12 @@ XGB_PARAMS_QTY = {
 XGB_NUM_ROUNDS_QTY = 5000
 XGB_EARLY_STOP_QTY = 100
 
-# Magnitude-aware sample weight for both regressors. WAPE is dominated by
-# the volume of the top pairs, so we weight each training row by its own
-# quantity (clipped at 1 so zero-rows don't disappear). This is implemented
-# as a helper in `03_train_model.py` and does NOT touch the feature table.
-REG_SAMPLE_WEIGHT_MIN = 1.0
+# NOTE — sample weights were tried for WAPE alignment (§5.6 of the report)
+# but produced catastrophic predictions on Tweedie: variance∝μ^p already
+# weights high-volume rows, so sample_weight=y double-counts and makes the
+# model systematically over-predict (val WAPE >3 instead of <1). Dropped.
+# If you want WAPE-aligned weighting, switch the objective to regression_l1
+# first — MAE is homoscedastic and accepts y-proportional weights cleanly.
 
 # Ridge stacker — blends (lgb_pred, xgb_pred, lag_52, pair_mean, pair_median).
 # `positive=True` and `fit_intercept=False` preserve zero-homogeneity and

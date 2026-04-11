@@ -143,17 +143,6 @@ print(f"Zero rate train: {z_tr.mean():.3f}   val: {z_va.mean():.3f}   test: {z_t
 
 # COMMAND ----------
 
-def reg_sample_weight(y: np.ndarray) -> np.ndarray:
-    """Magnitude-aware weight. Align the regressor loss with WAPE.
-
-    WAPE penalises absolute error proportionally to |y|, so giving each row a
-    weight proportional to its target focuses training on high-volume rows.
-    Clipped at 1 so zero rows still contribute (otherwise the regressor never
-    sees them at all).
-    """
-    return np.clip(y.astype(float), REG_SAMPLE_WEIGHT_MIN, None)
-
-
 def train_lgb_classifier(X_tr_, z_tr_, X_va_, z_va_, seed: int):
     params = dict(LGB_PARAMS_ZERO)
     params["seed"] = seed
@@ -179,12 +168,16 @@ def train_lgb_classifier(X_tr_, z_tr_, X_va_, z_va_, seed: int):
     )
 
 
-def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int, sample_weight=None):
+def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
+    # NOTE: no sample_weight. Tweedie already has an implicit heteroskedastic
+    # weighting (variance ∝ μ^p), so multiplying the loss by y double-counts
+    # high-volume rows and pushes the fit to over-predict. Stick to plain
+    # Tweedie — this matches the Fourth-good-model notebook.
     params = dict(LGB_PARAMS_QTY)
     params["seed"] = seed
     params["metric"] = "None"  # feval below is authoritative
     dtr = lgb.Dataset(
-        X_tr_, label=y_tr_, weight=sample_weight,
+        X_tr_, label=y_tr_,
         categorical_feature=FEATURES_CATEGORICAL,
         free_raw_data=False,
     )
@@ -206,10 +199,11 @@ def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int, sample_weight=Non
     )
 
 
-def train_xgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int, sample_weight=None):
+def train_xgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
+    # Same rationale as train_lgb_regressor: no sample_weight on Tweedie.
     params = dict(XGB_PARAMS_QTY)
     params["seed"] = seed
-    dtr = xgb.DMatrix(X_tr_, label=y_tr_, weight=sample_weight, enable_categorical=True)
+    dtr = xgb.DMatrix(X_tr_, label=y_tr_, enable_categorical=True)
     dva = xgb.DMatrix(X_va_, label=y_va_, enable_categorical=True)
     return xgb.train(
         params, dtr,
@@ -299,12 +293,11 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
     print("STAGE 2a — LightGBM Tweedie regressor")
     print("=" * 60)
 
-    w_tr = reg_sample_weight(y_tr)
     lgb_reg_models = []
     lgb_reg_val_preds = []
     for seed in ENSEMBLE_SEEDS:
         print(f"  seed={seed}")
-        m = train_lgb_regressor(X_tr, y_tr, X_va, y_va, seed, sample_weight=w_tr)
+        m = train_lgb_regressor(X_tr, y_tr, X_va, y_va, seed)
         lgb_reg_models.append(m)
         lgb_reg_val_preds.append(predict_lgb(m, X_va))
     lgb_val_avg = np.mean(np.stack(lgb_reg_val_preds, axis=0), axis=0)
@@ -319,7 +312,7 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
     xgb_reg_val_preds = []
     for seed in ENSEMBLE_SEEDS:
         print(f"  seed={seed}")
-        m = train_xgb_regressor(X_tr, y_tr, X_va, y_va, seed, sample_weight=w_tr)
+        m = train_xgb_regressor(X_tr, y_tr, X_va, y_va, seed)
         xgb_reg_models.append(m)
         xgb_reg_val_preds.append(predict_xgb(m, X_va))
     xgb_val_avg = np.mean(np.stack(xgb_reg_val_preds, axis=0), axis=0)
@@ -342,7 +335,6 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
 
         X_tr_sorted = X_tr.iloc[order].reset_index(drop=True)
         y_tr_sorted = y_tr[order]
-        w_tr_sorted = w_tr[order]
 
         oof_lgb_s = np.full(len(X_tr_sorted), np.nan, dtype=float)
         oof_xgb_s = np.full(len(X_tr_sorted), np.nan, dtype=float)
@@ -353,15 +345,14 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
             print(f"   fold {fold_ix + 1}/{STACKING_OOF_FOLDS}")
             Xf_tr = X_tr_sorted.iloc[tr_idx]
             yf_tr = y_tr_sorted[tr_idx]
-            wf_tr = w_tr_sorted[tr_idx]
             Xf_va = X_tr_sorted.iloc[va_idx]
             yf_va = y_tr_sorted[va_idx]
 
-            m_lgb_f = train_lgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed, sample_weight=wf_tr)
+            m_lgb_f = train_lgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed)
             oof_lgb_s[va_idx] = predict_lgb(m_lgb_f, Xf_va)
             del m_lgb_f; gc.collect()
 
-            m_xgb_f = train_xgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed, sample_weight=wf_tr)
+            m_xgb_f = train_xgb_regressor(Xf_tr, yf_tr, Xf_va, yf_va, first_seed)
             oof_xgb_s[va_idx] = predict_xgb(m_xgb_f, Xf_va)
             del m_xgb_f; gc.collect()
 

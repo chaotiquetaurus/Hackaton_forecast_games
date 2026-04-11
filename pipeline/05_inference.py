@@ -175,6 +175,24 @@ print(f"Mean predicted : {final_int.mean():.3f}")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### eNZO Test
+
+# COMMAND ----------
+
+
+NOM_EQUIPE = "telecacaton"   # ← remplacez par le nom de votre équipe
+
+# Ne touchez pas au reste
+TABLE_PREDICTIONS = f"workspace.default.predictions_equipe_{NOM_EQUIPE}"
+print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 6. Write final predictions
 
 # COMMAND ----------
@@ -194,9 +212,9 @@ out_sdf = (
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(TBL_PREDICTIONS_FINAL)
+    .saveAsTable(TABLE_PREDICTIONS)
 )
-print(f"Wrote {out_sdf.count():,} rows to {TBL_PREDICTIONS_FINAL}")
+print(f"Wrote {out_sdf.count():,} rows to {TABLE_PREDICTIONS}")
 
 # COMMAND ----------
 
@@ -206,7 +224,7 @@ print(f"Wrote {out_sdf.count():,} rows to {TBL_PREDICTIONS_FINAL}")
 # COMMAND ----------
 
 print("Predictions already saved to Delta table — CSV export skipped (DBFS not available on serverless).")
-print(f"Query your predictions with: SELECT * FROM {TBL_PREDICTIONS_FINAL}")
+print(f"Query your predictions with: SELECT * FROM {TABLE_PREDICTIONS}")
 
 # COMMAND ----------
 

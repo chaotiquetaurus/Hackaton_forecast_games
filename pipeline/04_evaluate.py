@@ -167,25 +167,23 @@ wape_nonzero = wape_numpy(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Zero classifier confusion matrix (at the tuned threshold)
+# MAGIC ## 4. Zero classifier confusion matrix (at the adaptive per-row threshold)
 
 # COMMAND ----------
 
-# Load the tuned threshold from the parent training run.
-runs = mlflow.search_runs(
-    experiment_names=[MLFLOW_EXPERIMENT],
-    filter_string="tags.mlflow.runName = 'train_pipeline'",
-    order_by=["start_time DESC"],
-    max_results=1,
-)
-if len(runs) == 0:
-    raise RuntimeError("No train_pipeline run found in MLflow — rerun 03_train_model.py first.")
-
-threshold = float(runs.iloc[0]["params.best_zero_threshold"])
-print(f"Using zero threshold from MLflow: {threshold}")
+# 03_train_model writes an effective per-row `threshold` column alongside
+# `p_zero`. We just read it back — no need to query MLflow for params.
+if "threshold" not in val_pd.columns:
+    raise RuntimeError(
+        "val_predictions table is missing the `threshold` column. "
+        "Re-run 03_train_model.py to regenerate it."
+    )
 
 y_true_zero = (val_pd["quantite"] == 0).astype(int).values
-y_pred_zero = (val_pd["p_zero"].values > threshold).astype(int)
+y_pred_zero = (val_pd["p_zero"].values > val_pd["threshold"].values).astype(int)
+
+threshold = float(val_pd["threshold"].mean())  # mean effective threshold, for the print
+print(f"Using per-row adaptive thresholds (mean = {threshold:.3f})")
 
 tp = int(((y_pred_zero == 1) & (y_true_zero == 1)).sum())
 tn = int(((y_pred_zero == 0) & (y_true_zero == 0)).sum())
@@ -263,5 +261,5 @@ print()
 print("--- Internal test WAPE per week ---")
 print(test_wape_by_week.to_string(index=False))
 print()
-print(f"Zero-clf precision / recall @ thr={threshold}: "
+print(f"Zero-clf precision / recall @ adaptive thr (mean={threshold:.3f}): "
       f"{precision_zero:.3f} / {recall_zero:.3f}")

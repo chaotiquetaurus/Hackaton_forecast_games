@@ -224,13 +224,88 @@ LGB_NUM_ROUNDS_QTY = 5000
 LGB_EARLY_STOP_QTY = 100
 
 # -----------------------------------------------------------------------------
-# Zero threshold search
+# Zero threshold search (legacy single-threshold grid)
 # -----------------------------------------------------------------------------
-# After both stages run, we sweep the probability threshold applied to the
-# zero classifier. Anything above it is forced to zero. The threshold that
-# minimises WAPE on validation is persisted as an MLflow parameter and read
-# back at inference time.
+# Kept for reference; the new training pipeline uses the adaptive grid below.
 ZERO_THRESHOLD_GRID = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+
+# -----------------------------------------------------------------------------
+# Ensemble / stacking additions (new model pipeline)
+# -----------------------------------------------------------------------------
+# These blocks are consumed exclusively by `03_train_model.py` and
+# `05_inference.py`. They have no effect on the feature engineering layer.
+
+# Multi-seed ensembling. Each listed seed trains one extra LGB clf / LGB reg /
+# XGB reg, and predictions are averaged before stacking. Default is a single
+# seed (fast); bump to `[42, 1337, 2024]` for the final run — cost scales
+# linearly with len(ENSEMBLE_SEEDS).
+ENSEMBLE_SEEDS = [SEED]
+
+# XGBoost regressor — added alongside LGB as a diversity term in the ensemble.
+# Same Tweedie objective so scales are comparable with LGB.
+XGB_PARAMS_QTY = {
+    "objective":              "reg:tweedie",
+    "tweedie_variance_power": 1.5,
+    "eval_metric":            "mae",
+    "learning_rate":          0.03,
+    "max_depth":              8,
+    "min_child_weight":       10.0,
+    "subsample":              0.8,
+    "colsample_bytree":       0.8,
+    "reg_alpha":              0.1,
+    "reg_lambda":             1.0,
+    "gamma":                  0.0,
+    "verbosity":              0,
+    "nthread":                -1,
+    "seed":                   SEED,
+}
+XGB_NUM_ROUNDS_QTY = 5000
+XGB_EARLY_STOP_QTY = 100
+
+# Magnitude-aware sample weight for both regressors. WAPE is dominated by
+# the volume of the top pairs, so we weight each training row by its own
+# quantity (clipped at 1 so zero-rows don't disappear). This is implemented
+# as a helper in `03_train_model.py` and does NOT touch the feature table.
+REG_SAMPLE_WEIGHT_MIN = 1.0
+
+# Ridge stacker — blends (lgb_pred, xgb_pred, lag_52, pair_mean, pair_median).
+# `positive=True` and `fit_intercept=False` preserve zero-homogeneity and
+# keep every meta-weight non-negative.
+STACK_BASELINE_COLS = ["lag_52", "pair_mean", "pair_median"]
+STACKING_RIDGE_ALPHA = 0.5
+
+# Out-of-fold predictions used to fit the Ridge safely.
+# - 0 (or 1)  → skip OOF, fit Ridge on validation preds directly (matches the
+#               notebook prototype; leakier but cheap).
+# - >= 2      → use TimeSeriesSplit with this many folds on the training set.
+#               Fit Ridge on OOF train predictions; this is the correct way
+#               to avoid over-fitting the stacker on validation.
+# Cost scales as ~n_folds × (LGB_reg + XGB_reg) for the first seed.
+STACKING_OOF_FOLDS = 3
+
+# Isotonic calibration of the zero classifier. Fitted on validation probas
+# vs actual `is_zero`, applied at inference to stabilise the adaptive threshold.
+CALIBRATE_ZERO_CLF = True
+
+# Adaptive zero threshold: thr(row) = clip(base - slope * pair_zero_rate, clip_lo, clip_hi).
+# Products with a high historical zero-rate get a lower threshold (more
+# aggressive zeroing). The (base, slope) pair is picked by a small grid
+# sweep on val WAPE — NOT a full hyperparameter search.
+ADAPTIVE_THRESHOLD_BASE_GRID  = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70]
+ADAPTIVE_THRESHOLD_SLOPE_GRID = [0.00, 0.10, 0.15, 0.20]
+ADAPTIVE_THRESHOLD_CLIP       = (0.15, 0.85)
+ZERO_RATE_FEATURE             = "pair_zero_rate_expanding"
+
+# Hard override: pairs flagged `is_dead_pair == 1` are forced to zero after
+# blending. Belt-and-braces on top of the classifier; cheap and safe.
+DEAD_PAIR_FORCE_ZERO = True
+
+# MLflow artifact folder name. The training notebook writes all models +
+# stacker + calibrator + a `manifest.json` under this sub-path; inference
+# downloads the same folder and rebuilds the pipeline in-process. This
+# replaces the Model Registry flow for the ensemble case because the
+# Registry does not elegantly represent k-model ensembles.
+MLFLOW_ENSEMBLE_ARTIFACT_PATH = "ensemble"
 
 # -----------------------------------------------------------------------------
 # Echo

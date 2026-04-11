@@ -500,8 +500,21 @@ def _predict_components(models, score_pdf):
     comment="Validation predictions of the single LightGBM residualized hurdle model on 2025-W01..W26"
 )
 def validation_predictions():
-    train_pdf = _to_pandas(_training_rows_for_validation(), include_target=True)
-    val_pdf = _to_pandas(_validation_rows(), include_target=True)
+    features = spark.read.table("lightgbm_features")
+    train_df = features.filter(
+        (F.col("is_test") == F.lit(False))
+        & (F.col("annee") < F.lit(VALIDATION_YEAR))
+        & (F.col("annee") >= F.lit(MIN_TRAIN_YEAR))
+    )
+    val_df = features.filter(
+        (F.col("is_test") == F.lit(False))
+        & (F.col("annee") == F.lit(VALIDATION_YEAR))
+        & (F.col("num_semaine").between(VALIDATION_WEEK_MIN, VALIDATION_WEEK_MAX))
+    )
+    train_pdf = _select_model_columns(train_df, True).toPandas()
+    val_pdf = _select_model_columns(val_df, True).toPandas()
+    if train_pdf.empty or val_pdf.empty:
+        return spark.createDataFrame([], schema=VALIDATION_SCHEMA)
     models = _fit_models(train_pdf, val_pdf)
     components = _predict_components(models, val_pdf)
 
@@ -523,8 +536,16 @@ def validation_predictions():
     comment="Final hidden-test predictions from the LightGBM residualized hurdle model"
 )
 def predictions():
-    train_pdf = _to_pandas(_training_rows_for_final_model(), include_target=True)
-    test_pdf = _to_pandas(_test_rows(), include_target=False)
+    features = spark.read.table("lightgbm_features")
+    train_df = features.filter(
+        (F.col("is_test") == F.lit(False))
+        & (F.col("annee") >= F.lit(MIN_TRAIN_YEAR))
+    )
+    test_df = features.filter(F.col("is_test") == F.lit(True))
+    train_pdf = _select_model_columns(train_df, True).toPandas()
+    test_pdf = _select_model_columns(test_df, False).toPandas()
+    if train_pdf.empty or test_pdf.empty:
+        return spark.createDataFrame([], schema=PREDICTION_SCHEMA)
     models = _fit_models(train_pdf, None)
     components = _predict_components(models, test_pdf)
 

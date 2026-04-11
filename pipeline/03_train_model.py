@@ -162,7 +162,11 @@ def train_lgb_classifier(X_tr_, z_tr_, X_va_, z_va_, seed: int):
         num_boost_round=LGB_NUM_ROUNDS_ZERO,
         valid_sets=[dva], valid_names=["val"],
         callbacks=[
-            lgb.early_stopping(LGB_EARLY_STOP_ZERO, first_metric_only=True),
+            lgb.early_stopping(
+                LGB_EARLY_STOP_ZERO,
+                first_metric_only=True,
+                min_delta=LGB_MIN_DELTA_ZERO,
+            ),
             lgb.log_evaluation(period=50),
         ],
     )
@@ -193,7 +197,11 @@ def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
         valid_sets=[dva], valid_names=["val"],
         feval=wape_lgb_feval,
         callbacks=[
-            lgb.early_stopping(LGB_EARLY_STOP_QTY, first_metric_only=True),
+            lgb.early_stopping(
+                LGB_EARLY_STOP_QTY,
+                first_metric_only=True,
+                min_delta=LGB_MIN_DELTA_QTY,
+            ),
             lgb.log_evaluation(period=50),
         ],
     )
@@ -205,11 +213,19 @@ def train_xgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
     params["seed"] = seed
     dtr = xgb.DMatrix(X_tr_, label=y_tr_, enable_categorical=True)
     dva = xgb.DMatrix(X_va_, label=y_va_, enable_categorical=True)
+    # xgb.callback.EarlyStopping exposes min_delta, xgb.train's simple
+    # early_stopping_rounds= arg does not. Use the callback to avoid
+    # burning iterations on sub-milliquème MAE improvements.
+    early_stop_cb = xgb.callback.EarlyStopping(
+        rounds=XGB_EARLY_STOP_QTY,
+        min_delta=XGB_MIN_DELTA_QTY,
+        save_best=True,
+    )
     return xgb.train(
         params, dtr,
         num_boost_round=XGB_NUM_ROUNDS_QTY,
         evals=[(dva, "val")],
-        early_stopping_rounds=XGB_EARLY_STOP_QTY,
+        callbacks=[early_stop_cb],
         verbose_eval=50,
     )
 

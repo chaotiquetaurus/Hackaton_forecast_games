@@ -194,6 +194,10 @@ LGB_PARAMS_ZERO = {
 }
 LGB_NUM_ROUNDS_ZERO = 3000
 LGB_EARLY_STOP_ZERO = 75
+# Minimum improvement (in logloss) required to count as progress. Without
+# this, the classifier keeps training through 0.0001-sized improvements
+# that are indistinguishable from val noise.
+LGB_MIN_DELTA_ZERO = 1e-3
 
 # -----------------------------------------------------------------------------
 # LightGBM hyperparameters — Stage 2: quantity regressor
@@ -222,6 +226,10 @@ LGB_PARAMS_QTY = {
 }
 LGB_NUM_ROUNDS_QTY = 5000
 LGB_EARLY_STOP_QTY = 100
+# Minimum improvement (in WAPE units) to count as progress. 1e-3 stops the
+# regressor as soon as the 50-iter gain falls below a milliquème — the
+# training curve plateaus to that scale around iter 800 on this dataset.
+LGB_MIN_DELTA_QTY = 1e-3
 
 # -----------------------------------------------------------------------------
 # Zero threshold search (legacy single-threshold grid)
@@ -261,6 +269,7 @@ XGB_PARAMS_QTY = {
 }
 XGB_NUM_ROUNDS_QTY = 5000
 XGB_EARLY_STOP_QTY = 100
+XGB_MIN_DELTA_QTY  = 1e-3
 
 # NOTE — sample weights were tried for WAPE alignment (§5.6 of the report)
 # but produced catastrophic predictions on Tweedie: variance∝μ^p already

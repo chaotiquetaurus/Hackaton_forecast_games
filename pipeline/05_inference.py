@@ -203,3 +203,8 @@ with mlflow.start_run(run_name="inference"):
     mlflow.log_param("qty_reg_version", v_qty)
     mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
     mlflow.log_metric("mean_pred", float(final_int.mean()))
+
+# COMMAND ----------
+
+# Leaderboard submission skipped — no permissions on predictions_equipe table
+print("Download the CSV from the table above instead.")

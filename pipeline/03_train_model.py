@@ -325,7 +325,7 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
 
     # ─────────────────── Stage 2a — LightGBM Tweedie regressor ─────────────
     print("=" * 60)
-    print("STAGE 2a — LightGBM Tweedie regressor (hurdle: non-zero only)")
+    print("STAGE 2a — LightGBM MAE regressor (hurdle: non-zero only)")
     print("=" * 60)
 
     lgb_reg_models = []
@@ -342,7 +342,7 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
 
     # ─────────────────── Stage 2b — XGBoost Tweedie regressor ──────────────
     print("=" * 60)
-    print("STAGE 2b — XGBoost Tweedie regressor (hurdle: non-zero only)")
+    print("STAGE 2b — XGBoost MAE regressor (hurdle: non-zero only)")
     print("=" * 60)
 
     xgb_reg_models = []
@@ -357,12 +357,33 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
 
     # ─────────────────────────── Stacker (Ridge) ───────────────────────────
     print("=" * 60)
-    print("STACKER — Ridge(positive=True, fit_intercept=False)")
+    print(f"STACKER — USE_STACKER={USE_STACKER}")
     print("=" * 60)
 
     stacker = Ridge(alpha=STACKING_RIDGE_ALPHA, positive=True, fit_intercept=False)
+    stack_feature_names = ["lgb", "xgb"] + STACK_BASELINE_COLS
 
-    if STACKING_OOF_FOLDS >= 2:
+    if not USE_STACKER:
+        # Bypass: use the raw LGB predictions as the "blend". XGB + baselines
+        # are ignored at blend time but both models still live in the artifact
+        # folder so the manifest stays uniform and the user can re-enable the
+        # stacker by flipping USE_STACKER without retraining.
+        # We still need a fitted sklearn Ridge object so .predict() works and
+        # the artifact pickles cleanly; fit on val then overwrite coef_.
+        print("  Stacker disabled — using raw LGB predictions as blend.")
+        nz_va_fit = y_va > 0
+        bl_va_fit = baseline_matrix(val_pd)
+        stacker.fit(
+            np.column_stack([
+                lgb_val_avg[nz_va_fit],
+                xgb_val_avg[nz_va_fit],
+                bl_va_fit[nz_va_fit],
+            ]),
+            y_va[nz_va_fit],
+        )
+        stacker.coef_ = np.array([1.0, 0.0] + [0.0] * len(STACK_BASELINE_COLS))
+        stack_fit_source = "bypass_lgb_only"
+    elif STACKING_OOF_FOLDS >= 2:
         # TimeSeriesSplit on train sorted by week_id. Only the first seed is
         # used for OOF (adding more seeds here is redundant with averaging).
         print(f"  Fitting OOF stacker with {STACKING_OOF_FOLDS} folds (first seed only)...")
@@ -434,7 +455,6 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         stack_fit_source = f"val_nonzero (n={int(nz_va_fit.sum())}/{len(y_va)})"
 
     coef = stacker.coef_
-    stack_feature_names = ["lgb", "xgb"] + STACK_BASELINE_COLS
     print("  Ridge weights:")
     for name, w in zip(stack_feature_names, coef):
         print(f"    {name:<12s} = {w: .4f}")

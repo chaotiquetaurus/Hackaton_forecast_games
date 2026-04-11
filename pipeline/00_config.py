@@ -202,15 +202,15 @@ LGB_MIN_DELTA_ZERO = 1e-3
 # -----------------------------------------------------------------------------
 # LightGBM hyperparameters — Stage 2: quantity regressor
 # -----------------------------------------------------------------------------
-# Tweedie is a strong default for zero-heavy non-negative targets; we still
-# train on log1p(quantite) because the evaluation pipeline tries both and
-# picks the lower-WAPE variant. Sample weights are proportional to the
-# quantity itself so the regressor focuses on high-volume pairs — the same
-# pairs that dominate WAPE.
+# MAE (regression_l1) on the non-zero hurdle subset. WAPE = MAE × N / sum|y|
+# and the denominator is constant over any fixed split, so minimising MAE is
+# equivalent to minimising WAPE directly. Tweedie was tried but its variance
+# compression (variance ∝ μ^p) under-predicts on the heavy tail, which the
+# Ridge stacker then amplifies with weights > 1 → val WAPE ~0.92 vs the
+# pre-rewrite pipeline's 0.87.
 LGB_PARAMS_QTY = {
-    "objective": "tweedie",
-    "tweedie_variance_power": 1.5,
-    "metric": "None",   # we use custom WAPE
+    "objective": "regression_l1",
+    "metric": "None",   # we use custom WAPE via feval
     "learning_rate": 0.03,
     "num_leaves": 255,
     "min_child_samples": 30,
@@ -249,11 +249,12 @@ ZERO_THRESHOLD_GRID = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.8
 # linearly with len(ENSEMBLE_SEEDS).
 ENSEMBLE_SEEDS = [SEED]
 
-# XGBoost regressor — added alongside LGB as a diversity term in the ensemble.
-# Same Tweedie objective so scales are comparable with LGB.
+# XGBoost regressor — diversity term in the ensemble. Objective matches LGB
+# (absolute error / MAE) so both models produce predictions on the same
+# scale and the Ridge stacker can blend them without bias correction.
+# reg:absoluteerror is available in XGBoost >= 2.1 (currently pinned 2.1.3).
 XGB_PARAMS_QTY = {
-    "objective":              "reg:tweedie",
-    "tweedie_variance_power": 1.5,
+    "objective":              "reg:absoluteerror",
     "eval_metric":            "mae",
     "learning_rate":          0.03,
     "max_depth":              8,
@@ -281,6 +282,14 @@ XGB_MIN_DELTA_QTY  = 1e-3
 # Ridge stacker — blends (lgb_pred, xgb_pred, lag_52, pair_mean, pair_median).
 # `positive=True` and `fit_intercept=False` preserve zero-homogeneity and
 # keep every meta-weight non-negative.
+#
+# USE_STACKER toggle: when False, `blend = lgb_val_avg` directly (XGB and the
+# baselines are skipped at blend time, though both models still train so the
+# artifacts keep the same shape). This is the escape hatch if the Ridge
+# starts producing weights whose sum exceeds 1 — a pathology that can
+# happen because Ridge minimises MSE, not WAPE, and on heavy-tailed data
+# MSE-optimal scaling diverges from WAPE-optimal scaling.
+USE_STACKER = True
 STACK_BASELINE_COLS = ["lag_52", "pair_mean", "pair_median"]
 STACKING_RIDGE_ALPHA = 0.5
 

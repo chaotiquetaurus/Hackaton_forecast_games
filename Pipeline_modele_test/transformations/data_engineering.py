@@ -65,6 +65,13 @@ def _safe_divide(numerator, denominator):
     ).otherwise(F.lit(None).cast("double"))
 
 
+def _clipped_safe_divide(numerator, denominator, lower=0.0, upper=3.0):
+    ratio = _safe_divide(numerator, denominator)
+    return F.when(ratio.isNull(), F.lit(None).cast("double")).otherwise(
+        F.least(F.lit(upper), F.greatest(F.lit(lower), ratio))
+    )
+
+
 @dp.materialized_view(comment="Training sales data with parsed time features")
 def features_train():
     return _with_sales_types(
@@ -328,7 +335,7 @@ def lightgbm_features():
         )
     )
 
-    return (
+    enriched = (
         lagged.join(spark.read.table("agence_features"), ["code_agence"], "left")
         .join(spark.read.table("article_features"), KEY_COLS, "left")
         .join(fact_prev_year_month, KEY_COLS + ["annee", "target_month"], "left")
@@ -336,4 +343,222 @@ def lightgbm_features():
         .withColumn("has_article_reference", F.col("famille").isNotNull())
         .withColumn("has_prev_year_month_billing", F.col("fact_prev_year_month_nb_achats").isNotNull())
         .withColumn("has_prev_year_total_billing", F.col("fact_prev_year_total_nb_achats").isNotNull())
+    )
+
+    agency_week_history = enriched.groupBy("code_agence", "week_index").agg(
+        F.sum("quantite").alias("agency_week_volume")
+    )
+    family_week_history = enriched.groupBy("famille", "week_index").agg(
+        F.sum("quantite").alias("family_week_volume")
+    )
+    agency_family_week_history = enriched.groupBy("code_agence", "famille", "week_index").agg(
+        F.sum("quantite").alias("agency_family_week_volume")
+    )
+
+    enriched_with_group_lags = (
+        enriched.join(
+            agency_week_history.select(
+                "code_agence",
+                (F.col("week_index") + F.lit(26)).alias("week_index"),
+                F.col("agency_week_volume").alias("agency_week_volume_lag_26"),
+            ),
+            ["code_agence", "week_index"],
+            "left",
+        )
+        .join(
+            agency_week_history.select(
+                "code_agence",
+                (F.col("week_index") + F.lit(52)).alias("week_index"),
+                F.col("agency_week_volume").alias("agency_week_volume_lag_52"),
+            ),
+            ["code_agence", "week_index"],
+            "left",
+        )
+        .join(
+            family_week_history.select(
+                "famille",
+                (F.col("week_index") + F.lit(26)).alias("week_index"),
+                F.col("family_week_volume").alias("family_week_volume_lag_26"),
+            ),
+            ["famille", "week_index"],
+            "left",
+        )
+        .join(
+            family_week_history.select(
+                "famille",
+                (F.col("week_index") + F.lit(52)).alias("week_index"),
+                F.col("family_week_volume").alias("family_week_volume_lag_52"),
+            ),
+            ["famille", "week_index"],
+            "left",
+        )
+        .join(
+            agency_family_week_history.select(
+                "code_agence",
+                "famille",
+                (F.col("week_index") + F.lit(26)).alias("week_index"),
+                F.col("agency_family_week_volume").alias("agency_family_week_volume_lag_26"),
+            ),
+            ["code_agence", "famille", "week_index"],
+            "left",
+        )
+        .join(
+            agency_family_week_history.select(
+                "code_agence",
+                "famille",
+                (F.col("week_index") + F.lit(52)).alias("week_index"),
+                F.col("agency_family_week_volume").alias("agency_family_week_volume_lag_52"),
+            ),
+            ["code_agence", "famille", "week_index"],
+            "left",
+        )
+        .withColumn(
+            "agency_volume_trend_26_52",
+            _clipped_safe_divide(
+                F.col("agency_week_volume_lag_26"),
+                F.col("agency_week_volume_lag_52"),
+            ),
+        )
+        .withColumn(
+            "family_volume_trend_26_52",
+            _clipped_safe_divide(
+                F.col("family_week_volume_lag_26"),
+                F.col("family_week_volume_lag_52"),
+            ),
+        )
+        .withColumn(
+            "agency_family_volume_trend_26_52",
+            _clipped_safe_divide(
+                F.col("agency_family_week_volume_lag_26"),
+                F.col("agency_family_week_volume_lag_52"),
+            ),
+        )
+    )
+
+    return (
+        enriched_with_group_lags.withColumn("is_week_1", (F.col("num_semaine") == F.lit(1)).cast("double"))
+        .withColumn("is_winter_restart", F.col("num_semaine").between(1, 2).cast("double"))
+        .withColumn("is_post_new_year_ramp", F.col("num_semaine").between(3, 5).cast("double"))
+        .withColumn("is_spring_high_season", F.col("num_semaine").between(14, 24).cast("double"))
+        .withColumn("is_pre_summer_peak", F.col("num_semaine").between(24, 27).cast("double"))
+        .withColumn("is_summer_holiday", F.col("num_semaine").between(31, 34).cast("double"))
+        .withColumn("is_year_end_holiday", F.col("num_semaine").between(51, 52).cast("double"))
+        .withColumn(
+            "is_holiday_trough",
+            (
+                F.col("num_semaine").between(1, 2)
+                | F.col("num_semaine").between(31, 34)
+                | F.col("num_semaine").between(51, 52)
+            ).cast("double"),
+        )
+        .withColumn(
+            "billing_prev_year_month_weekly_rate",
+            _safe_divide(F.col("fact_prev_year_month_sum_quantite"), F.lit(4.33)),
+        )
+        .withColumn(
+            "billing_prev_year_total_weekly_rate",
+            _safe_divide(F.col("fact_prev_year_total_sum_quantite"), F.lit(52.0)),
+        )
+        .withColumn(
+            "history_strength",
+            F.least(
+                F.lit(1.0),
+                F.coalesce(_safe_divide(F.col("pair_nonzero_weeks_to_lag_26"), F.lit(52.0)), F.lit(0.0)),
+            ),
+        )
+        .withColumn(
+            "baseline_trend_factor",
+            F.least(
+                F.lit(1.60),
+                F.greatest(
+                    F.lit(0.45),
+                    F.coalesce(
+                        F.col("recent_over_long_mean"),
+                        F.col("lag_26_over_lag_52"),
+                        F.col("agency_family_volume_trend_26_52"),
+                        F.col("agency_volume_trend_26_52"),
+                        F.col("family_volume_trend_26_52"),
+                        F.col("lag_52_over_lag_104"),
+                        F.lit(1.0),
+                    ),
+                ),
+            ),
+        )
+        .withColumn(
+            "seasonal_baseline_raw",
+            F.greatest(
+                F.lit(0.0),
+                F.coalesce(F.col("lag_52"), F.lit(0.0)) * F.col("baseline_trend_factor") * F.lit(0.42)
+                + F.coalesce(F.col("rolling_mean_26_52"), F.lit(0.0)) * F.lit(0.22)
+                + F.coalesce(F.col("rolling_mean_52_104"), F.lit(0.0)) * F.lit(0.12)
+                + F.coalesce(F.col("pair_mean_to_lag_26"), F.lit(0.0)) * F.lit(0.12)
+                + F.coalesce(F.col("billing_prev_year_month_weekly_rate"), F.lit(0.0)) * F.lit(0.08)
+                + F.coalesce(F.col("billing_prev_year_total_weekly_rate"), F.lit(0.0)) * F.lit(0.04),
+            ),
+        )
+        .withColumn(
+            "calendar_baseline_factor",
+            F.when(F.col("is_week_1") == F.lit(1.0), F.lit(0.55))
+            .when(F.col("is_winter_restart") == F.lit(1.0), F.lit(0.75))
+            .when(F.col("is_summer_holiday") == F.lit(1.0), F.lit(0.72))
+            .when(F.col("is_year_end_holiday") == F.lit(1.0), F.lit(0.65))
+            .otherwise(F.lit(1.0)),
+        )
+        .withColumn(
+            "sparse_baseline_factor",
+            F.when(
+                (F.col("pair_zero_rate_to_lag_26") >= F.lit(0.98))
+                & (F.coalesce(F.col("lag_52"), F.lit(0.0)) <= F.lit(0.0))
+                & (F.coalesce(F.col("rolling_mean_26_52"), F.lit(0.0)) <= F.lit(0.05))
+                & (F.coalesce(F.col("fact_prev_year_month_nb_achats"), F.lit(0.0)) <= F.lit(0.0)),
+                F.lit(0.03),
+            )
+            .when(
+                (F.col("pair_zero_rate_to_lag_26") >= F.lit(0.95))
+                & (F.coalesce(F.col("lag_52"), F.lit(0.0)) <= F.lit(0.0)),
+                F.lit(0.18),
+            )
+            .when(
+                (F.col("pair_zero_rate_to_lag_26") >= F.lit(0.85))
+                & (F.coalesce(F.col("lag_52"), F.lit(0.0)) <= F.lit(0.0))
+                & (F.coalesce(F.col("fact_prev_year_month_nb_achats"), F.lit(0.0)) <= F.lit(0.0)),
+                F.lit(0.45),
+            )
+            .when(
+                (F.col("zero_rate_26_52") >= F.lit(0.90))
+                & (F.col("seasonal_baseline_raw") <= F.lit(1.0)),
+                F.lit(0.70),
+            )
+            .otherwise(F.lit(1.0)),
+        )
+        .withColumn(
+            "baseline_prediction",
+            F.greatest(
+                F.lit(0.0),
+                F.col("seasonal_baseline_raw") * F.col("calendar_baseline_factor"),
+            ),
+        )
+        .withColumn(
+            "sparse_adjusted_baseline",
+            F.greatest(
+                F.lit(0.0),
+                F.col("baseline_prediction") * F.col("sparse_baseline_factor"),
+            ),
+        )
+        .withColumn(
+            "baseline_to_recent_ratio",
+            _safe_divide(F.col("sparse_adjusted_baseline"), F.col("rolling_mean_26_52")),
+        )
+        .withColumn(
+            "baseline_to_lag52_ratio",
+            _safe_divide(F.col("sparse_adjusted_baseline"), F.col("lag_52")),
+        )
+        .withColumn(
+            "baseline_zero_prior",
+            (
+                (F.col("pair_zero_rate_to_lag_26") >= F.lit(0.95))
+                & (F.coalesce(F.col("lag_52"), F.lit(0.0)) <= F.lit(0.0))
+                & (F.coalesce(F.col("fact_prev_year_month_nb_achats"), F.lit(0.0)) <= F.lit(0.0))
+            ).cast("double"),
+        )
     )

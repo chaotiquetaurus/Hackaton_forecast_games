@@ -7,7 +7,7 @@ from pyspark.sql import functions as F
 # Evaluation for the single production model
 # ---------------------------------------------------------------------------
 #
-# These views test the LightGBM hurdle model in depth. They do not choose
+# These views test the LightGBM residualized hurdle model in depth. They do not choose
 # between model families; their purpose is to explain where this precise model
 # wins or fails so the next feature/model iteration is obvious.
 
@@ -26,6 +26,15 @@ FEATURES_TO_MONITOR = [
     "rolling_mean_26_52",
     "zero_rate_26_52",
     "pair_mean_to_lag_26",
+    "agency_week_volume_lag_52",
+    "family_week_volume_lag_52",
+    "agency_family_week_volume_lag_52",
+    "agency_family_volume_trend_26_52",
+    "baseline_prediction",
+    "sparse_adjusted_baseline",
+    "baseline_zero_prior",
+    "calendar_baseline_factor",
+    "sparse_baseline_factor",
     "fact_prev_year_month_nb_achats",
     "fact_prev_year_total_sum_quantite",
     "famille",
@@ -48,6 +57,12 @@ def _validation_predictions():
         .withColumn("annee", F.split(F.col("semaine"), "-").getItem(0).cast("int"))
         .withColumn("num_semaine", F.split(F.col("semaine"), "-").getItem(1).cast("int"))
         .withColumn("prediction", F.greatest(F.col("prediction").cast("double"), F.lit(0.0)))
+        .withColumn(
+            "model_baseline_prediction",
+            F.greatest(F.col("model_baseline_prediction").cast("double"), F.lit(0.0)),
+        )
+        .withColumn("raw_prediction", F.greatest(F.col("raw_prediction").cast("double"), F.lit(0.0)))
+        .withColumn("zero_guard_multiplier", F.col("zero_guard_multiplier").cast("double"))
         .withColumn("quantite", F.greatest(F.col("quantite").cast("double"), F.lit(0.0)))
         .withColumn("absolute_error", F.abs(F.col("quantite") - F.col("prediction")))
         .withColumn("signed_error", F.col("prediction") - F.col("quantite"))
@@ -79,6 +94,21 @@ def _validation_with_features():
         "zero_rate_26_52",
         "lag_26",
         "lag_52",
+        "agency_week_volume_lag_26",
+        "agency_week_volume_lag_52",
+        "family_week_volume_lag_26",
+        "family_week_volume_lag_52",
+        "agency_family_week_volume_lag_26",
+        "agency_family_week_volume_lag_52",
+        "agency_family_volume_trend_26_52",
+        "sparse_adjusted_baseline",
+        "seasonal_baseline_raw",
+        "calendar_baseline_factor",
+        "sparse_baseline_factor",
+        "baseline_zero_prior",
+        "history_strength",
+        "is_week_1",
+        "is_holiday_trough",
         "fact_prev_year_month_nb_achats",
         "fact_prev_year_total_sum_quantite",
     ]
@@ -122,6 +152,9 @@ def _metric_aggregations():
                 F.col("quantite"),
             ).otherwise(F.lit(0.0))
         ).alias("missed_actual_volume_from_false_zeros"),
+        F.sum("model_baseline_prediction").alias("model_baseline_volume"),
+        F.sum("raw_prediction").alias("raw_prediction_volume_before_zero_guard"),
+        F.avg("zero_guard_multiplier").alias("avg_zero_guard_multiplier"),
     ]
 
 
@@ -157,7 +190,7 @@ def _with_intermittency_segment(df):
     )
 
 
-@dp.materialized_view(comment="Overall validation WAPE for the LightGBM hurdle model")
+@dp.materialized_view(comment="Overall validation WAPE for the LightGBM residualized hurdle model")
 def wape_score():
     return _validation_predictions().groupBy("model_version").agg(
         _wape().alias("wape"),
@@ -165,11 +198,14 @@ def wape_score():
         F.countDistinct(*KEY_COLS).alias("n_validation_pairs"),
         F.sum("quantite").alias("actual_volume"),
         F.sum("prediction").alias("predicted_volume"),
+        F.sum("model_baseline_prediction").alias("model_baseline_volume"),
+        F.sum("raw_prediction").alias("raw_prediction_volume_before_zero_guard"),
         F.avg("sale_probability").alias("avg_sale_probability"),
+        F.avg("zero_guard_multiplier").alias("avg_zero_guard_multiplier"),
     )
 
 
-@dp.materialized_view(comment="Core validation diagnostics for the LightGBM hurdle model")
+@dp.materialized_view(comment="Core validation diagnostics for the LightGBM residualized hurdle model")
 def validation_model_diagnostics():
     return _validation_predictions().groupBy("model_version").agg(*_metric_aggregations())
 
@@ -281,8 +317,35 @@ def validation_probability_calibration():
             F.avg("sale_probability").alias("avg_sale_probability"),
             F.avg("direct_prediction").alias("avg_direct_prediction"),
             F.avg("hurdle_prediction").alias("avg_hurdle_prediction"),
+            F.avg("model_baseline_prediction").alias("avg_model_baseline_prediction"),
+            F.avg("raw_prediction").alias("avg_raw_prediction_before_zero_guard"),
         )
         .orderBy("sale_probability_bucket")
+    )
+
+
+@dp.materialized_view(comment="Actual-zero overprediction diagnostics by sparse history and probability")
+def validation_zero_overprediction_by_sparse_probability():
+    return (
+        _with_probability_bucket(_with_intermittency_segment(_validation_with_features()))
+        .filter(F.col("quantite") == F.lit(0.0))
+        .groupBy("model_version", "intermittency_segment", "sale_probability_bucket")
+        .agg(
+            F.count("*").alias("n_actual_zero_rows"),
+            F.sum("prediction").alias("predicted_volume_on_actual_zeros"),
+            F.sum("raw_prediction").alias("raw_volume_before_zero_guard_on_actual_zeros"),
+            F.avg("prediction").alias("avg_prediction_on_actual_zeros"),
+            F.avg("raw_prediction").alias("avg_raw_prediction_before_zero_guard"),
+            F.avg("model_baseline_prediction").alias("avg_model_baseline_prediction"),
+            F.avg("direct_prediction").alias("avg_direct_prediction"),
+            F.avg("hurdle_prediction").alias("avg_hurdle_prediction"),
+            F.avg("sale_probability").alias("avg_sale_probability"),
+            F.avg("zero_guard_multiplier").alias("avg_zero_guard_multiplier"),
+            F.avg("pair_zero_rate_to_lag_26").alias("avg_pair_zero_rate_to_lag_26"),
+            F.avg("sparse_baseline_factor").alias("avg_sparse_baseline_factor"),
+            F.avg("baseline_zero_prior").alias("avg_baseline_zero_prior"),
+        )
+        .orderBy("intermittency_segment", "sale_probability_bucket")
     )
 
 
@@ -305,15 +368,27 @@ def validation_largest_errors():
             "region",
             "quantite",
             "prediction",
+            "raw_prediction",
+            "model_baseline_prediction",
             "direct_prediction",
             "hurdle_prediction",
             "sale_probability",
+            "zero_guard_multiplier",
             "absolute_error",
             "signed_error",
             "lag_26",
             "lag_52",
             "rolling_mean_26_52",
             "zero_rate_26_52",
+            "agency_week_volume_lag_52",
+            "family_week_volume_lag_52",
+            "agency_family_week_volume_lag_52",
+            "agency_family_volume_trend_26_52",
+            "sparse_adjusted_baseline",
+            "seasonal_baseline_raw",
+            "calendar_baseline_factor",
+            "sparse_baseline_factor",
+            "baseline_zero_prior",
             "fact_prev_year_month_nb_achats",
             "fact_prev_year_total_sum_quantite",
         )

@@ -82,6 +82,7 @@ from src.utils import (
     apply_non_iterative_feature_fallbacks,
     wape_numpy,
     wape_lgb_feval,
+    wape_xgb_feval,
 )
 
 # COMMAND ----------
@@ -212,22 +213,33 @@ def train_lgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
 
 def train_xgb_regressor(X_tr_, y_tr_, X_va_, y_va_, seed: int):
     # Same rationale as train_lgb_regressor: no sample_weight on Tweedie.
+    # Eval metric is our custom WAPE (same definition used by the LGB
+    # regressor), so the xgb logs line up 1:1 with the lgb logs and early
+    # stopping compares apples to apples.
     params = dict(XGB_PARAMS_QTY)
     params["seed"] = seed
+    # Drop any `eval_metric` from params: we replace it with custom_metric.
+    params.pop("eval_metric", None)
+    params["disable_default_eval_metric"] = 1
+
     dtr = xgb.DMatrix(X_tr_, label=y_tr_, enable_categorical=True)
     dva = xgb.DMatrix(X_va_, label=y_va_, enable_categorical=True)
+
     # xgb.callback.EarlyStopping exposes min_delta, xgb.train's simple
-    # early_stopping_rounds= arg does not. Use the callback to avoid
-    # burning iterations on sub-milliquème MAE improvements.
+    # early_stopping_rounds= arg does not. `maximize=False` is explicit
+    # because XGBoost cannot auto-detect direction for custom metrics.
     early_stop_cb = xgb.callback.EarlyStopping(
         rounds=XGB_EARLY_STOP_QTY,
         min_delta=XGB_MIN_DELTA_QTY,
+        metric_name="wape",
+        maximize=False,
         save_best=True,
     )
     return xgb.train(
         params, dtr,
         num_boost_round=XGB_NUM_ROUNDS_QTY,
         evals=[(dva, "val")],
+        custom_metric=wape_xgb_feval,
         callbacks=[early_stop_cb],
         verbose_eval=50,
     )

@@ -87,6 +87,17 @@ def wape_lgb_feval(y_pred, dataset):
     return "wape", wape_numpy(y_true, y_pred), False
 
 
+def wape_xgb_feval(y_pred, dmatrix):
+    """XGBoost custom metric (API ≥2.0).
+
+    Signature is `(predt, dmatrix) → (name, value)`. XGBoost's new
+    `custom_metric=` argument expects this shape. Direction is controlled
+    separately via `xgb.callback.EarlyStopping(maximize=False)`.
+    """
+    y_true = dmatrix.get_label()
+    return "wape", float(wape_numpy(y_true, y_pred))
+
+
 def apply_non_iterative_feature_fallbacks(df: pd.DataFrame, features: Iterable[str]) -> pd.DataFrame:
     """Fill block-forecast features without recursive predictions."""
     out = df.copy()

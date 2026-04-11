@@ -4,32 +4,40 @@ from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-from config import PAIR_KEYS, LAGS_ALL, ROLLING_WINDOWS, ROLLING_MEDIAN_WINDOWS, FEATURES
+from config import (
+    PAIR_KEYS,
+    LAGS_ALL,
+    ROLLING_WINDOWS,
+    ROLLING_MEDIAN_WINDOWS,
+    FEATURES,
+    TRAIN_END_WEEK_ID,
+    VAL_START_WEEK_ID,
+    VAL_END_WEEK_ID,
+    INTERNAL_TEST_START_WEEK_ID,
+    INTERNAL_TEST_END_WEEK_ID,
+    FINAL_INFERENCE_START_WEEK_ID,
+    FINAL_INFERENCE_END_WEEK_ID,
+)
 
 
 # ============================================================================
 # GOLD: feature table + temporal splits
 # ============================================================================
 
-@dp.materialized_view(
-    name="gold_feature_table",
-    comment=(
-        "Weekly feature table (train + test) with lags, rolling stats, "
-        "expanding pair/agency/article stats, same-week-of-year history, "
-        "billing-derived metrics, temporal encodings and categorical dims. "
-        "Every window is strictly past (rowsBetween(..., -1))."
-    ),
-    partition_cols=["annee"],
-    table_properties={"quality": "gold"},
-)
-def gold_feature_table():
-    panel = spark.read.table("silver_panel")
-    articles_enc = spark.read.table("silver_articles_encoded")
-    agences_enc = spark.read.table("silver_agences_encoded")
-    fac = spark.read.table("silver_facturation_lagged")
+def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week_id, split_name):
+    """Build features using only targets up to `history_end_week_id`.
 
-    # Double-cast of target so every window aggregation stays in double-land.
-    df = panel.withColumn("y", F.col("quantite").cast("double"))
+    This lets validation/test/final-inference rows mimic a 26-week block
+    forecast: target values inside the scored horizon are masked before lags,
+    rolling stats, expanding stats and zero rates are computed.
+    """
+    df = panel.withColumn(
+        "y",
+        F.when(
+            F.col("week_id") <= F.lit(history_end_week_id),
+            F.col("quantite").cast("double"),
+        ).otherwise(F.lit(None).cast("double")),
+    ).withColumn("split_name", F.lit(split_name))
 
     pair_order = Window.partitionBy(*PAIR_KEYS).orderBy("week_id")
 
@@ -37,7 +45,7 @@ def gold_feature_table():
     for n in LAGS_ALL:
         df = df.withColumn(f"lag_{n}", F.lag("y", n).over(pair_order))
 
-    # --- 2. Rolling mean / std ---------------------------------------------
+    # --- 2. Rolling mean / std --------------------------------------------
     def _lookback(n):
         return (
             Window.partitionBy(*PAIR_KEYS)
@@ -60,7 +68,9 @@ def gold_feature_table():
     # --- 3. Zero rates and short-term trend --------------------------------
     df = df.withColumn(
         "_y_is_zero",
-        F.when(F.col("y") == 0, F.lit(1.0)).otherwise(F.lit(0.0)),
+        F.when(F.col("y").isNull(), F.lit(None).cast("double"))
+         .when(F.col("y") == 0, F.lit(1.0))
+         .otherwise(F.lit(0.0)),
     )
     df = (
         df
@@ -76,12 +86,8 @@ def gold_feature_table():
         )
     )
 
-    recent_w = (
-        Window.partitionBy(*PAIR_KEYS).orderBy("week_id").rowsBetween(-4, -1)
-    )
-    prev_w = (
-        Window.partitionBy(*PAIR_KEYS).orderBy("week_id").rowsBetween(-8, -5)
-    )
+    recent_w = Window.partitionBy(*PAIR_KEYS).orderBy("week_id").rowsBetween(-4, -1)
+    prev_w = Window.partitionBy(*PAIR_KEYS).orderBy("week_id").rowsBetween(-8, -5)
     df = (
         df
         .withColumn("_mean_recent4", F.avg("y").over(recent_w))
@@ -220,7 +226,7 @@ def gold_feature_table():
 
     # --- 10. Final projection ----------------------------------------------
     base_cols = [
-        "semaine", "week_id",
+        "semaine", "week_id", "split_name",
         "code_agence", "code_article",
         "quantite", "quantite_raw", "quantite_smooth",
         "is_anomaly", "is_capped", "is_dead_pair",
@@ -234,44 +240,105 @@ def gold_feature_table():
     return df.select(*base_cols, *FEATURES)
 
 
+@dp.materialized_view(
+    name="gold_feature_table",
+    comment=(
+        "Weekly feature table with leakage-safe train, validation, internal "
+        "test and final-inference splits. Validation/test/final horizons mask "
+        "their own target values before lag and rolling features are computed."
+    ),
+    partition_cols=["annee"],
+    table_properties={"quality": "gold"},
+)
+def gold_feature_table():
+    panel = spark.read.table("silver_panel")
+    articles_enc = spark.read.table("silver_articles_encoded")
+    agences_enc = spark.read.table("silver_agences_encoded")
+    fac = spark.read.table("silver_facturation_lagged")
+
+    train = (
+        _build_feature_frame(panel, articles_enc, agences_enc, fac, TRAIN_END_WEEK_ID, "train")
+        .filter(F.col("week_id") <= F.lit(TRAIN_END_WEEK_ID))
+    )
+    validation = (
+        _build_feature_frame(panel, articles_enc, agences_enc, fac, TRAIN_END_WEEK_ID, "validation")
+        .filter(
+            (F.col("week_id") >= F.lit(VAL_START_WEEK_ID))
+            & (F.col("week_id") <= F.lit(VAL_END_WEEK_ID))
+        )
+    )
+    internal_test = (
+        _build_feature_frame(panel, articles_enc, agences_enc, fac, VAL_END_WEEK_ID, "internal_test")
+        .filter(
+            (F.col("week_id") >= F.lit(INTERNAL_TEST_START_WEEK_ID))
+            & (F.col("week_id") <= F.lit(INTERNAL_TEST_END_WEEK_ID))
+        )
+    )
+    final_inference = (
+        _build_feature_frame(
+            panel,
+            articles_enc,
+            agences_enc,
+            fac,
+            INTERNAL_TEST_END_WEEK_ID,
+            "final_inference",
+        )
+        .filter(
+            (F.col("week_id") >= F.lit(FINAL_INFERENCE_START_WEEK_ID))
+            & (F.col("week_id") <= F.lit(FINAL_INFERENCE_END_WEEK_ID))
+        )
+    )
+
+    return (
+        train
+        .unionByName(validation)
+        .unionByName(internal_test)
+        .unionByName(final_inference)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gold splits
 # ---------------------------------------------------------------------------
 
 @dp.materialized_view(
     name="gold_train",
-    comment="Training split: weeks strictly before 2025-W01.",
+    comment="Training split: weeks up to 2024-W26.",
     table_properties={"quality": "gold"},
 )
 @dp.expect_or_drop("quantite_not_null", "quantite IS NOT NULL")
 def gold_train():
-    return spark.read.table("gold_feature_table").filter(F.col("semaine") < "2025-01")
+    return spark.read.table("gold_feature_table").filter(F.col("split_name") == "train")
 
 
 @dp.materialized_view(
     name="gold_validation",
-    comment="Validation split: 2025-W01 .. 2025-W26.",
+    comment="Validation split: 2024-W27 .. 2024-W52, with masked-horizon features.",
     table_properties={"quality": "gold"},
 )
 @dp.expect_or_drop("quantite_not_null", "quantite IS NOT NULL")
 def gold_validation():
-    return (
-        spark.read.table("gold_feature_table")
-        .filter((F.col("semaine") >= "2025-01") & (F.col("semaine") <= "2025-26"))
-    )
+    return spark.read.table("gold_feature_table").filter(F.col("split_name") == "validation")
+
+
+@dp.materialized_view(
+    name="gold_internal_test",
+    comment="Labelled internal test split: 2025-W01 .. 2025-W26, never used for training.",
+    table_properties={"quality": "gold"},
+)
+@dp.expect_or_drop("quantite_not_null", "quantite IS NOT NULL")
+def gold_internal_test():
+    return spark.read.table("gold_feature_table").filter(F.col("split_name") == "internal_test")
 
 
 @dp.materialized_view(
     name="gold_test_features",
     comment=(
-        "Feature rows for the test period (2025-W27 .. 2025-W52). "
-        "quantite is null — consumed by the inference notebook."
+        "Final-inference feature rows for the leaderboard period "
+        "(2025-W27 .. 2025-W52). quantite is null."
     ),
     table_properties={"quality": "gold"},
 )
 @dp.expect_or_fail("quantite_is_null", "quantite IS NULL")
 def gold_test_features():
-    return (
-        spark.read.table("gold_feature_table")
-        .filter((F.col("semaine") >= "2025-27") & (F.col("semaine") <= "2025-52"))
-    )
+    return spark.read.table("gold_feature_table").filter(F.col("split_name") == "final_inference")

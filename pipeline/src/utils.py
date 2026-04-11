@@ -87,6 +87,37 @@ def wape_lgb_feval(y_pred, dataset):
     return "wape", wape_numpy(y_true, y_pred), False
 
 
+def apply_non_iterative_feature_fallbacks(df: pd.DataFrame, features: Iterable[str]) -> pd.DataFrame:
+    """Fill block-forecast features without recursive predictions."""
+    out = df.copy()
+    feature_set = set(features)
+
+    if "pair_mean" in out.columns:
+        for c in feature_set:
+            if not c.startswith("lag_"):
+                continue
+            try:
+                n = int(c.split("_")[1])
+            except (IndexError, ValueError):
+                continue
+            if n < 26 and c in out.columns:
+                out[c] = out[c].fillna(out["pair_mean"])
+
+    for short, long in [
+        ("roll_mean_4", "roll_mean_26"),
+        ("roll_mean_8", "roll_mean_26"),
+        ("roll_mean_13", "roll_mean_26"),
+        ("roll_std_4", "roll_std_26"),
+        ("roll_std_8", "roll_std_26"),
+        ("roll_std_13", "roll_std_26"),
+        ("roll_median_4", "roll_median_13"),
+    ]:
+        if short in out.columns and long in out.columns:
+            out[short] = out[short].fillna(out[long])
+
+    return out
+
+
 # ----------------------------------------------------------------------------
 # 3. SPARK WINDOW HELPERS (NO LEAKAGE)
 # ----------------------------------------------------------------------------

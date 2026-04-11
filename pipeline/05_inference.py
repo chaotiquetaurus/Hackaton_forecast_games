@@ -52,6 +52,8 @@ import mlflow.lightgbm
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType
 
+from src.utils import apply_non_iterative_feature_fallbacks
+
 # COMMAND ----------
 
 mlflow.set_experiment(MLFLOW_EXPERIMENT)
@@ -111,10 +113,10 @@ print(f"Loaded zero_classifier v{v_zero}, qty_regressor v{v_qty}")
 
 feature_cols = ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"] + FEATURES
 
-test_features_sdf = spark.table(TBL_GOLD_TEST).select(*feature_cols)
+test_features_sdf = spark.table(TBL_GOLD_FINAL_INFERENCE).select(*feature_cols)
 
 test_df = test_features_sdf.toPandas()
-print(f"Test rows: {len(test_df):,}   (expected 272 344)")
+print(f"Final inference rows: {len(test_df):,}   (expected 272 344)")
 
 # COMMAND ----------
 
@@ -123,26 +125,7 @@ print(f"Test rows: {len(test_df):,}   (expected 272 344)")
 
 # COMMAND ----------
 
-# Lags 1..25 will be null because the target is missing for test rows and
-# all the weeks in-between also have null targets. We fall back on pair_mean,
-# which is an expanding statistic computed from training history only.
-short_lags = [c for c in FEATURES if c.startswith("lag_") and int(c.split("_")[1]) < 26]
-for c in short_lags:
-    test_df[c] = test_df[c].fillna(test_df["pair_mean"])
-
-# Rolling stats with windows shorter than 26 weeks suffer the same issue.
-# Impute their nulls with the matching long-horizon value.
-for short, long in [
-    ("roll_mean_4", "roll_mean_26"),
-    ("roll_mean_8", "roll_mean_26"),
-    ("roll_mean_13", "roll_mean_26"),
-    ("roll_std_4", "roll_std_26"),
-    ("roll_std_8", "roll_std_26"),
-    ("roll_std_13", "roll_std_26"),
-    ("roll_median_4", "roll_median_13"),
-]:
-    if short in test_df.columns and long in test_df.columns:
-        test_df[short] = test_df[short].fillna(test_df[long])
+test_df[FEATURES] = apply_non_iterative_feature_fallbacks(test_df[FEATURES], FEATURES)
 
 # COMMAND ----------
 

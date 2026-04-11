@@ -30,9 +30,10 @@ pair for 2025-W27 .. 2025-W52. Metric: **WAPE**.
 │  └─ gold_feature_table         ← lags, rolling stats, pair/agency/article        │
 │     │                            expanding stats, seasonal stats, billing        │
 │     │                            joins, sin/cos, calendar flags, categoricals    │
-│     ├─ gold_train              (filter semaine < 2025-01)                        │
-│     ├─ gold_validation         (filter 2025-01 .. 2025-26)                       │
-│     └─ gold_test_features      (filter 2025-27 .. 2025-52)                       │
+│     ├─ gold_train              (<= 2024-W26)                                     │
+│     ├─ gold_validation         (2024-W27 .. 2024-W52)                            │
+│     ├─ gold_internal_test      (2025-W01 .. 2025-W26)                            │
+│     └─ gold_test_features      (final inference: 2025-W27 .. 2025-W52)           │
 └──────────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -87,7 +88,7 @@ the ML notebooks downstream.
 | `silver_articles_encoded` | pair keys not null | **fail pipeline** |
 | `silver_panel` | `semaine IS NOT NULL` | drop row |
 | `silver_panel` | keys not null | drop row |
-| `gold_train` / `gold_validation` | `quantite IS NOT NULL` | drop row |
+| `gold_train` / `gold_validation` / `gold_internal_test` | `quantite IS NOT NULL` | drop row |
 | `gold_test_features` | `quantite IS NULL` | **fail pipeline** |
 
 The last one is deliberately strict: if any test row somehow has a
@@ -114,9 +115,10 @@ train/test boundary has leaked.
 
 | Set | `semaine` range |
 |-----|-----------------|
-| Train | `< "2025-01"` |
-| Validation | `"2025-01" .. "2025-26"` |
-| Test | `"2025-27" .. "2025-52"` |
+| Train | `<= 2024-W26` |
+| Validation | `2024-W27 .. 2024-W52` |
+| Internal labelled test | `2025-W01 .. 2025-W26` |
+| Final inference / submission | `2025-W27 .. 2025-W52` |
 
 The DLT `gold_*` tables encode these filters.
 

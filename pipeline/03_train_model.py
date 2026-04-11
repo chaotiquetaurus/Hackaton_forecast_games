@@ -43,7 +43,11 @@ from mlflow.models import infer_signature
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType, DoubleType, StringType, StructField, StructType
 
-from src.utils import wape_numpy, wape_lgb_feval
+from src.utils import (
+    apply_non_iterative_feature_fallbacks,
+    wape_numpy,
+    wape_lgb_feval,
+)
 
 # COMMAND ----------
 
@@ -67,14 +71,17 @@ cols_needed = (
 
 train_sdf = spark.table(TBL_GOLD_TRAIN).select(*cols_needed)
 val_sdf = spark.table(TBL_GOLD_VAL).select(*cols_needed)
+test_sdf = spark.table(TBL_GOLD_INTERNAL_TEST).select(*cols_needed)
 
 train_pd = train_sdf.toPandas()
 val_pd = val_sdf.toPandas()
+test_pd = test_sdf.toPandas()
 
-print(f"Train: {len(train_pd):,}   Val: {len(val_pd):,}")
+print(f"Train: {len(train_pd):,}   Val: {len(val_pd):,}   Internal test: {len(test_pd):,}")
 
 # Double-check the split has no overlap.
 assert train_pd["week_id"].max() < val_pd["week_id"].min(), "Temporal split broken"
+assert val_pd["week_id"].max() < test_pd["week_id"].min(), "Temporal split broken"
 
 # COMMAND ----------
 
@@ -83,8 +90,10 @@ assert train_pd["week_id"].max() < val_pd["week_id"].min(), "Temporal split brok
 
 # COMMAND ----------
 
-def build_xy(df: pd.DataFrame):
+def build_xy(df: pd.DataFrame, use_non_iterative_fallbacks: bool = False):
     X = df[FEATURES].copy()
+    if use_non_iterative_fallbacks:
+        X = apply_non_iterative_feature_fallbacks(X, FEATURES)
     # Cast categorical encodings to pandas 'category' so LightGBM handles them natively.
     for c in FEATURES_CATEGORICAL:
         if c in X.columns:
@@ -94,9 +103,10 @@ def build_xy(df: pd.DataFrame):
     return X, y, is_zero
 
 X_tr, y_tr, z_tr = build_xy(train_pd)
-X_va, y_va, z_va = build_xy(val_pd)
+X_va, y_va, z_va = build_xy(val_pd, use_non_iterative_fallbacks=True)
+X_te, y_te, z_te = build_xy(test_pd, use_non_iterative_fallbacks=True)
 
-print(f"Zero rate train: {z_tr.mean():.3f}   val: {z_va.mean():.3f}")
+print(f"Zero rate train: {z_tr.mean():.3f}   val: {z_va.mean():.3f}   test: {z_te.mean():.3f}")
 
 # COMMAND ----------
 
@@ -113,8 +123,11 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         "n_features": len(FEATURES),
         "train_rows": len(train_pd),
         "val_rows": len(val_pd),
-        "train_end": VAL_START_WEEK_ID,
+        "internal_test_rows": len(test_pd),
+        "train_end": TRAIN_END_WEEK_ID,
         "val_end": VAL_END_WEEK_ID,
+        "internal_test_start": INTERNAL_TEST_START_WEEK_ID,
+        "internal_test_end": INTERNAL_TEST_END_WEEK_ID,
     })
 
     # -------- Stage 1 --------
@@ -274,3 +287,29 @@ with mlflow.start_run(run_name="train_pipeline") as parent_run:
         .saveAsTable(TBL_VAL_PREDICTIONS)
     )
     print(f"Wrote validation predictions to {TBL_VAL_PREDICTIONS}")
+
+    # -------- Score the labelled internal test set once, after tuning --------
+    p_zero_test = model_zero.predict(X_te, num_iteration=model_zero.best_iteration)
+    qty_test_raw = model_qty.predict(X_te, num_iteration=model_qty.best_iteration)
+    qty_test = np.clip(qty_test_raw, 0.0, None)
+    test_final = np.where(p_zero_test > best_threshold, 0.0, qty_test)
+    test_wape = wape_numpy(y_te, test_final)
+    mlflow.log_metric("internal_test_wape", test_wape)
+
+    test_out = test_pd[["semaine", "code_agence", "code_article", "quantite"]].copy()
+    test_out["p_zero"] = p_zero_test
+    test_out["qty_pred"] = qty_test
+    test_out["prediction"] = test_final
+
+    test_sdf = spark.createDataFrame(test_out, schema=schema)
+    (
+        test_sdf.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(TBL_INTERNAL_TEST_PREDICTIONS)
+    )
+    print(
+        f"Wrote internal test predictions to {TBL_INTERNAL_TEST_PREDICTIONS} "
+        f"(WAPE={test_wape:.4f})"
+    )

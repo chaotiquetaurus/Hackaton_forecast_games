@@ -12,6 +12,19 @@ TBL_FACTURATION = "workspace.default.donnees_facturation"
 # Pair key reused by every windowed feature
 PAIR_KEYS = ["code_agence", "code_article"]
 
+# Temporal splits
+# Known-label train: up to 2024-W26.
+# Validation: 2024-W27 .. 2024-W52, with its horizon masked for lag features.
+# Internal labelled test: 2025-W01 .. 2025-W26, masked the same way.
+# Final inference / leaderboard: 2025-W27 .. 2025-W52.
+TRAIN_END_WEEK_ID = 202426
+VAL_START_WEEK_ID = 202427
+VAL_END_WEEK_ID = 202452
+INTERNAL_TEST_START_WEEK_ID = 202501
+INTERNAL_TEST_END_WEEK_ID = 202526
+FINAL_INFERENCE_START_WEEK_ID = 202527
+FINAL_INFERENCE_END_WEEK_ID = 202552
+
 # Data cleaning knobs
 OUTLIER_PERCENTILE = 0.995
 ANOMALY_MULTIPLIER = 10.0

@@ -14,7 +14,8 @@
 # MAGIC
 # MAGIC - `workspace.default.gold_train`
 # MAGIC - `workspace.default.gold_validation`
-# MAGIC - `workspace.default.gold_test_features`
+# MAGIC - `workspace.default.gold_internal_test`
+# MAGIC - `workspace.default.gold_test_features` (final-inference horizon)
 # MAGIC - `workspace.default.silver_ventes` (used by 04 for baselines)
 
 # COMMAND ----------
@@ -28,7 +29,13 @@
 
 # COMMAND ----------
 
-for tbl in [TBL_SILVER_VENTES, TBL_GOLD_TRAIN, TBL_GOLD_VAL, TBL_GOLD_TEST]:
+for tbl in [
+    TBL_SILVER_VENTES,
+    TBL_GOLD_TRAIN,
+    TBL_GOLD_VAL,
+    TBL_GOLD_INTERNAL_TEST,
+    TBL_GOLD_FINAL_INFERENCE,
+]:
     n = spark.table(tbl).count()
     assert n > 0, f"Lakeflow table {tbl} is empty — run pipeline_lakeflow.py first."
     print(f"{tbl:<50} {n:>12,} rows")

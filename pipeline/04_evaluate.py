@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC Reads the validation predictions persisted by 03_train_model.py and
 # MAGIC reports:
-# MAGIC - **Global WAPE** on 2025-W01..W26
+# MAGIC - **Global WAPE** on validation 2024-W27..W52 and internal test 2025-W01..W26
 # MAGIC - WAPE broken down by agency, top-20 articles, week, and specialty
 # MAGIC - Comparison against three baselines (lag-52, global mean, blend)
 # MAGIC - Zero-classifier confusion matrix
@@ -40,11 +40,13 @@ mlflow.set_experiment(MLFLOW_EXPERIMENT)
 # COMMAND ----------
 
 val_sdf = spark.table(TBL_VAL_PREDICTIONS)
+internal_test_sdf = spark.table(TBL_INTERNAL_TEST_PREDICTIONS)
 articles = spark.table(TBL_ARTICLES).select("code_agence", "code_article",
     *[c for c in ["specialite"] if c in spark.table(TBL_ARTICLES).columns]
 )
 
 val_enriched = val_sdf.join(articles, ["code_agence", "code_article"], "left")
+internal_test_enriched = internal_test_sdf.join(articles, ["code_agence", "code_article"], "left")
 
 # COMMAND ----------
 
@@ -105,13 +107,15 @@ baselines = {
     "blend_seasonal": wape_spark(val_base, "quantite", "blend_pred"),
 }
 
-# Our model's WAPE on the same set.
+# Our model's WAPE on the same set, plus the internal test held out from tuning.
 model_wape = wape_spark(val_sdf, "quantite", "prediction")
+internal_test_wape = wape_spark(internal_test_sdf, "quantite", "prediction")
 
 print("=== WAPE summary ===")
-summary_rows = [{"model": k, "wape": v} for k, v in baselines.items()]
-summary_rows.append({"model": "two_stage_lgbm", "wape": model_wape})
-summary_df = pd.DataFrame(summary_rows).sort_values("wape")
+summary_rows = [{"split": "validation", "model": k, "wape": v} for k, v in baselines.items()]
+summary_rows.append({"split": "validation", "model": "two_stage_lgbm", "wape": model_wape})
+summary_rows.append({"split": "internal_test", "model": "two_stage_lgbm", "wape": internal_test_wape})
+summary_df = pd.DataFrame(summary_rows).sort_values(["split", "wape"])
 print(summary_df.to_string(index=False))
 
 # COMMAND ----------
@@ -122,6 +126,7 @@ print(summary_df.to_string(index=False))
 # COMMAND ----------
 
 val_pd = val_enriched.toPandas()
+internal_test_pd = internal_test_enriched.toPandas()
 
 def wape_by(df: pd.DataFrame, key: str) -> pd.DataFrame:
     grp = (
@@ -137,6 +142,7 @@ def wape_by(df: pd.DataFrame, key: str) -> pd.DataFrame:
 
 wape_by_agency = wape_by(val_pd, "code_agence")
 wape_by_week = wape_by(val_pd, "semaine")
+test_wape_by_week = wape_by(internal_test_pd, "semaine")
 
 top_articles = (
     val_pd.groupby("code_article")["quantite"].sum().nlargest(20).index
@@ -201,6 +207,7 @@ print(f"   precision={precision_zero:.3f}  recall={recall_zero:.3f}")
 
 with mlflow.start_run(run_name="evaluation"):
     mlflow.log_metric("val_wape_model", model_wape)
+    mlflow.log_metric("internal_test_wape_model", internal_test_wape)
     for name, v in baselines.items():
         mlflow.log_metric(f"val_wape_{name}", v)
     mlflow.log_metric("val_wape_zero_slice", wape_zero)
@@ -217,12 +224,14 @@ with mlflow.start_run(run_name="evaluation"):
     summary_df.to_csv("/tmp/wape_summary.csv", index=False)
     wape_by_agency.to_csv("/tmp/wape_by_agency.csv", index=False)
     wape_by_week.to_csv("/tmp/wape_by_week.csv", index=False)
+    test_wape_by_week.to_csv("/tmp/internal_test_wape_by_week.csv", index=False)
     wape_top_articles.to_csv("/tmp/wape_top_articles.csv", index=False)
     wape_by_specialty.to_csv("/tmp/wape_by_specialty.csv", index=False)
     for f in [
         "/tmp/wape_summary.csv",
         "/tmp/wape_by_agency.csv",
         "/tmp/wape_by_week.csv",
+        "/tmp/internal_test_wape_by_week.csv",
         "/tmp/wape_top_articles.csv",
         "/tmp/wape_by_specialty.csv",
     ]:
@@ -240,6 +249,8 @@ print("             SGDB 2026 — VALIDATION REPORT")
 print("=" * 60)
 print(summary_df.to_string(index=False))
 print()
+print(f"Internal test WAPE : {internal_test_wape:.4f}")
+print()
 print(f"Zero-slice WAPE     : {wape_zero:.4f}")
 print(f"Non-zero slice WAPE : {wape_nonzero:.4f}")
 print()
@@ -248,6 +259,9 @@ print(wape_by_agency.head(5).to_string(index=False))
 print()
 print("--- WAPE per week ---")
 print(wape_by_week.to_string(index=False))
+print()
+print("--- Internal test WAPE per week ---")
+print(test_wape_by_week.to_string(index=False))
 print()
 print(f"Zero-clf precision / recall @ thr={threshold}: "
       f"{precision_zero:.3f} / {recall_zero:.3f}")

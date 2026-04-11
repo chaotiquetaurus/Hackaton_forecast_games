@@ -44,23 +44,36 @@ TBL_SILVER_PANEL = "workspace.default.silver_panel"
 TBL_GOLD_FEATURES = "workspace.default.gold_feature_table"
 TBL_GOLD_TRAIN = "workspace.default.gold_train"
 TBL_GOLD_VAL = "workspace.default.gold_validation"
-TBL_GOLD_TEST = "workspace.default.gold_test_features"
+TBL_GOLD_INTERNAL_TEST = "workspace.default.gold_internal_test"
+TBL_GOLD_FINAL_INFERENCE = "workspace.default.gold_test_features"
+# Backward-compatible alias. This table is the hidden final-inference horizon,
+# not the labelled internal test set.
+TBL_GOLD_TEST = TBL_GOLD_FINAL_INFERENCE
 
 # ML-notebook-owned tables (not produced by DLT):
 TBL_PREDICTIONS_FINAL = "workspace.default.predictions_final"
 TBL_VAL_PREDICTIONS = "workspace.default.val_predictions"
+TBL_INTERNAL_TEST_PREDICTIONS = "workspace.default.internal_test_predictions"
 
 # -----------------------------------------------------------------------------
 # Temporal splits
 # -----------------------------------------------------------------------------
-# Train on everything strictly before 2025-W01.
-# Validate on 2025-W01 .. 2025-W26 (first semester 2025).
-# Predict (test) on 2025-W27 .. 2025-W52.
-TRAIN_END_WEEK_ID = 202500   # train rows have week_id <  202501
-VAL_START_WEEK_ID = 202501
-VAL_END_WEEK_ID = 202526
-TEST_START_WEEK_ID = 202527
-TEST_END_WEEK_ID = 202552
+# Train on everything up to 2024-W26.
+# Validate on 2024-W27 .. 2024-W52 with the validation horizon masked when
+# building lag/rolling features.
+# Internal labelled test: 2025-W01 .. 2025-W26, also masked at feature time.
+# Final inference / leaderboard submission: 2025-W27 .. 2025-W52.
+TRAIN_END_WEEK_ID = 202426
+VAL_START_WEEK_ID = 202427
+VAL_END_WEEK_ID = 202452
+INTERNAL_TEST_START_WEEK_ID = 202501
+INTERNAL_TEST_END_WEEK_ID = 202526
+FINAL_INFERENCE_START_WEEK_ID = 202527
+FINAL_INFERENCE_END_WEEK_ID = 202552
+
+# Short aliases kept for older notebook text; use the explicit names in new code.
+TEST_START_WEEK_ID = INTERNAL_TEST_START_WEEK_ID
+TEST_END_WEEK_ID = INTERNAL_TEST_END_WEEK_ID
 
 # -----------------------------------------------------------------------------
 # MLflow experiment
@@ -224,8 +237,9 @@ ZERO_THRESHOLD_GRID = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.8
 # -----------------------------------------------------------------------------
 print(f"Team            : {NOM_EQUIPE}")
 print(f"Submission tbl  : {TABLE_PREDICTIONS}")
-print(f"Train end       : week_id < {VAL_START_WEEK_ID}")
+print(f"Train           : week_id <= {TRAIN_END_WEEK_ID}")
 print(f"Validation      : [{VAL_START_WEEK_ID}, {VAL_END_WEEK_ID}]")
-print(f"Test (predict)  : [{TEST_START_WEEK_ID}, {TEST_END_WEEK_ID}]")
+print(f"Internal test   : [{INTERNAL_TEST_START_WEEK_ID}, {INTERNAL_TEST_END_WEEK_ID}]")
+print(f"Final inference : [{FINAL_INFERENCE_START_WEEK_ID}, {FINAL_INFERENCE_END_WEEK_ID}]")
 print(f"#features       : {len(FEATURES)}  ({len(FEATURES_NUMERIC)} num, {len(FEATURES_CATEGORICAL)} cat)")
 print(f"Seed            : {SEED}")

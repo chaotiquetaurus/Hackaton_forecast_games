@@ -197,24 +197,10 @@ print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
 
 # COMMAND ----------
 
-out_df = test_df[["semaine", "code_agence", "code_article"]].copy()
-out_df["quantite"] = final_int
-
-out_sdf = (
-    spark.createDataFrame(out_df)
-    .withColumn("code_agence", F.col("code_agence").cast(LongType()))
-    .withColumn("code_article", F.col("code_article").cast(LongType()))
-    .withColumn("quantite", F.col("quantite").cast(LongType()))
-)
-
-(
-    out_sdf.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(TABLE_PREDICTIONS)
-)
-print(f"Wrote {out_sdf.count():,} rows to {TABLE_PREDICTIONS}")
+out_sdf = spark.table("workspace.default.predictions_final")
+print(f"{out_sdf.count():,} rows")
+display(out_sdf)
+print("Use the download button above to save as CSV")
 
 # COMMAND ----------
 
@@ -238,5 +224,5 @@ with mlflow.start_run(run_name="inference"):
 
 # COMMAND ----------
 
-out_sdf.write.mode("overwrite").saveAsTable(f"workspace.default.`predictions_equipe_{NOM_EQUIPE}`")
-print(f"Submitted to leaderboard: workspace.default.predictions_equipe_{NOM_EQUIPE}")
+# Leaderboard submission skipped — no permissions on predictions_equipe table
+print("Download the CSV from the table above instead.")

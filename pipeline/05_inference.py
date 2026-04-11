@@ -197,10 +197,23 @@ print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
 
 # COMMAND ----------
 
+import base64
+
 out_sdf = spark.table("workspace.default.predictions_final")
 print(f"{out_sdf.count():,} rows")
+
+# Write full CSV for download
+out_pd = out_sdf.toPandas()
+csv_bytes = out_pd.to_csv(index=False).encode("utf-8")
+b64 = base64.b64encode(csv_bytes).decode("utf-8")
+
+displayHTML(
+    f'<a download="predictions_final.csv" '
+    f'href="data:text/csv;base64,{b64}" '
+    f'style="font-size:16px">⬇ Download all {len(out_pd):,} rows as CSV</a>'
+)
+
 display(out_sdf)
-print("Use the download button above to save as CSV")
 
 # COMMAND ----------
 

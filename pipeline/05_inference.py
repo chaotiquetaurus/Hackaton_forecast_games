@@ -65,16 +65,54 @@ mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
 # COMMAND ----------
 
+# Look back through recent `train_pipeline` runs until we find one that
+# actually has an `ensemble/` artifact folder. Older runs (from before the
+# ensemble rewrite) or aborted runs may satisfy the run-name filter without
+# having the artifacts we need, and blindly taking the latest one then
+# raises an opaque "Failed to download artifacts" error.
+from mlflow.tracking import MlflowClient  # noqa: E402
+
+_client = MlflowClient()
+
 runs = mlflow.search_runs(
     experiment_names=[MLFLOW_EXPERIMENT],
     filter_string="tags.mlflow.runName = 'train_pipeline'",
     order_by=["start_time DESC"],
-    max_results=1,
+    max_results=10,
 )
 if len(runs) == 0:
     raise RuntimeError("No train_pipeline run found; run 03_train_model.py first.")
 
-run_id = runs.iloc[0]["run_id"]
+
+def _run_has_ensemble(client: MlflowClient, rid: str) -> bool:
+    try:
+        artifacts = client.list_artifacts(rid)
+    except Exception:
+        return False
+    for a in artifacts:
+        if a.path == MLFLOW_ENSEMBLE_ARTIFACT_PATH and a.is_dir:
+            return True
+    return False
+
+
+run_id = None
+for _, row in runs.iterrows():
+    candidate = row["run_id"]
+    if _run_has_ensemble(_client, candidate):
+        run_id = candidate
+        break
+    else:
+        print(f"  (skip {candidate[:8]} — no '{MLFLOW_ENSEMBLE_ARTIFACT_PATH}/' artifact)")
+
+if run_id is None:
+    latest_artifacts = [a.path for a in _client.list_artifacts(runs.iloc[0]["run_id"])]
+    raise RuntimeError(
+        f"None of the last {len(runs)} train_pipeline runs contain an "
+        f"'{MLFLOW_ENSEMBLE_ARTIFACT_PATH}/' artifact folder. The latest run "
+        f"({runs.iloc[0]['run_id']}) has: {latest_artifacts}. "
+        "Re-run 03_train_model.py end-to-end with the current code."
+    )
+
 print(f"Loading ensemble from run {run_id}")
 
 local_dir = mlflow.artifacts.download_artifacts(

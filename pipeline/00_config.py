@@ -285,11 +285,18 @@ XGB_MIN_DELTA_QTY  = 1e-3
 #
 # USE_STACKER toggle: when False, `blend = lgb_val_avg` directly (XGB and the
 # baselines are skipped at blend time, though both models still train so the
-# artifacts keep the same shape). This is the escape hatch if the Ridge
-# starts producing weights whose sum exceeds 1 — a pathology that can
-# happen because Ridge minimises MSE, not WAPE, and on heavy-tailed data
-# MSE-optimal scaling diverges from WAPE-optimal scaling.
-USE_STACKER = True
+# artifacts keep the same shape).
+#
+# DEFAULT = False because Ridge minimises MSE while the MAE-trained
+# regressors predict the conditional MEDIAN. On right-skewed retail
+# targets (mean/median ratio ~1.5) the Ridge systematically rescales LGB
+# by that ratio, which forces the adaptive threshold into max-aggressive
+# gating (kills ~78% of real sales) to recover. Net result on this data:
+# final WAPE 0.92 with stacker vs ~0.80-0.85 expected without. Bypassing
+# is correct here; flip to True only if you fix the objective mismatch
+# (e.g. switch the Ridge to an L1-minimising blend, or retrain models to
+# predict the mean).
+USE_STACKER = False
 STACK_BASELINE_COLS = ["lag_52", "pair_mean", "pair_median"]
 STACKING_RIDGE_ALPHA = 0.5
 
@@ -316,9 +323,13 @@ CALIBRATE_ZERO_CLF = True
 # Products with a high historical zero-rate get a lower threshold (more
 # aggressive zeroing). The (base, slope) pair is picked by a small grid
 # sweep on val WAPE — NOT a full hyperparameter search.
-ADAPTIVE_THRESHOLD_BASE_GRID  = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70]
-ADAPTIVE_THRESHOLD_SLOPE_GRID = [0.00, 0.10, 0.15, 0.20]
-ADAPTIVE_THRESHOLD_CLIP       = (0.15, 0.85)
+# Base grid widened up to 0.80 because the pre-bypass runs systematically
+# hit the lowest corner (0.40) — that was a symptom of stacker over-scaling,
+# not a genuinely better threshold. With USE_STACKER=False the expectation
+# is the optimum lands around 0.55-0.70.
+ADAPTIVE_THRESHOLD_BASE_GRID  = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+ADAPTIVE_THRESHOLD_SLOPE_GRID = [0.00, 0.05, 0.10, 0.15, 0.20]
+ADAPTIVE_THRESHOLD_CLIP       = (0.15, 0.90)
 ZERO_RATE_FEATURE             = "pair_zero_rate_expanding"
 
 # Hard override: pairs flagged `is_dead_pair == 1` are forced to zero after

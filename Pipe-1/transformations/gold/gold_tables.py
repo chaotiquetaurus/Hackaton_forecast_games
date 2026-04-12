@@ -71,11 +71,20 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
         F.when(F.col("y").isNull(), F.lit(None).cast("double"))
          .when(F.col("y") == 0, F.lit(1.0))
          .otherwise(F.lit(0.0)),
+    ).withColumn(
+        "_y_is_positive",
+        F.when(F.col("y").isNull(), F.lit(None).cast("double"))
+         .when(F.col("y") > 0, F.lit(1.0))
+         .otherwise(F.lit(0.0)),
     )
     df = (
         df
         .withColumn("zero_rate_26", F.avg("_y_is_zero").over(_lookback(26)))
         .withColumn("zero_rate_52", F.avg("_y_is_zero").over(_lookback(52)))
+        .withColumn("active_rate_13", F.avg("_y_is_positive").over(_lookback(13)))
+        .withColumn("active_rate_26", F.avg("_y_is_positive").over(_lookback(26)))
+        .withColumn("recent_sum_13", F.sum("y").over(_lookback(13)))
+        .withColumn("recent_sum_26", F.sum("y").over(_lookback(26)))
         .withColumn(
             "pair_zero_rate_expanding",
             F.avg("_y_is_zero").over(
@@ -84,6 +93,11 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
                 .rowsBetween(Window.unboundedPreceding, -1)
             ),
         )
+        .withColumn("lag_1_is_zero", F.when(F.col("lag_1").isNull(), None).otherwise((F.col("lag_1") == 0).cast("double")))
+        .withColumn("lag_2_is_zero", F.when(F.col("lag_2").isNull(), None).otherwise((F.col("lag_2") == 0).cast("double")))
+        .withColumn("has_lag_1", F.col("lag_1").isNotNull().cast("double"))
+        .withColumn("has_lag_13", F.col("lag_13").isNotNull().cast("double"))
+        .withColumn("has_lag_52", F.col("lag_52").isNotNull().cast("double"))
     )
 
     recent_w = Window.partitionBy(*PAIR_KEYS).orderBy("week_id").rowsBetween(-4, -1)
@@ -118,6 +132,7 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
     )
 
     # --- 4. Pair expanding stats -------------------------------------------
+    df = df.withColumn("_pair_obs_idx", F.row_number().over(pair_order) - F.lit(1))
     pair_exp = (
         Window.partitionBy(*PAIR_KEYS)
         .orderBy("week_id")
@@ -130,6 +145,23 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
         .withColumn("pair_max", F.max("y").over(pair_exp))
         .withColumn("pair_count", F.count("y").over(pair_exp))
         .withColumn("_pair_std", F.stddev("y").over(pair_exp))
+        .withColumn(
+            "n_active_weeks",
+            F.sum((F.col("y") > 0).cast("double")).over(pair_exp),
+        )
+        .withColumn("_last_positive_obs_idx", F.max(F.when(F.col("y") > 0, F.col("_pair_obs_idx"))).over(pair_exp))
+        .withColumn(
+            "weeks_since_last_sale",
+            F.when(F.col("_last_positive_obs_idx").isNull(), None)
+             .otherwise(F.col("_pair_obs_idx") - F.col("_last_positive_obs_idx")),
+        )
+        .withColumn(
+            "pair_active_rate_expanding",
+            F.when(
+                F.col("pair_count").isNull() | (F.col("pair_count") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("n_active_weeks") / F.col("pair_count")),
+        )
         .withColumn(
             "pair_cv",
             F.when(
@@ -144,10 +176,6 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
                 F.lit(None).cast("double"),
             ).otherwise(F.col("lag_52") / F.col("pair_mean")),
         )
-        .withColumn(
-            "n_active_weeks",
-            F.sum((F.col("y") > 0).cast("double")).over(pair_exp),
-        )
     )
 
     # --- 5. Same-week-of-year stats ----------------------------------------
@@ -161,6 +189,48 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
         .withColumn("sem_mean", F.avg("y").over(season_w))
         .withColumn("sem_max", F.max("y").over(season_w))
         .withColumn("sem_median", F.expr("percentile_approx(y, 0.5)").over(season_w))
+        .withColumn(
+            "roll_mean_4_vs_13",
+            F.when(
+                F.col("roll_mean_13").isNull() | (F.col("roll_mean_13") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("roll_mean_4") / F.col("roll_mean_13")),
+        )
+        .withColumn(
+            "roll_mean_13_vs_52",
+            F.when(
+                F.col("roll_mean_52").isNull() | (F.col("roll_mean_52") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("roll_mean_13") / F.col("roll_mean_52")),
+        )
+        .withColumn(
+            "lag1_vs_roll13",
+            F.when(
+                F.col("roll_mean_13").isNull() | (F.col("roll_mean_13") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("lag_1") / F.col("roll_mean_13")),
+        )
+        .withColumn(
+            "lag1_minus_roll13",
+            F.when(
+                F.col("lag_1").isNull() | F.col("roll_mean_13").isNull(),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("lag_1") - F.col("roll_mean_13")),
+        )
+        .withColumn(
+            "roll_std_13_ratio",
+            F.when(
+                F.col("roll_mean_13").isNull() | (F.col("roll_mean_13") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("roll_std_13") / F.col("roll_mean_13")),
+        )
+        .withColumn(
+            "sem_mean_vs_pair_mean",
+            F.when(
+                F.col("pair_mean").isNull() | (F.col("pair_mean") == 0),
+                F.lit(None).cast("double"),
+            ).otherwise(F.col("sem_mean") / F.col("pair_mean")),
+        )
     )
 
     # --- 6. Agency & article expanding stats -------------------------------
@@ -189,6 +259,12 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
         .withColumn("sin_sem", F.sin(two_pi * F.col("num_sem") / F.lit(52.0)))
         .withColumn("cos_sem", F.cos(two_pi * F.col("num_sem") / F.lit(52.0)))
         .withColumn(
+            "month_num",
+            F.least(F.lit(12), F.greatest(F.lit(1), F.ceil(F.col("num_sem") / F.lit(4.333)))),
+        )
+        .withColumn("quarter_num", F.ceil(F.col("month_num") / F.lit(3.0)))
+        .withColumn("weeks_to_year_end", F.lit(52) - F.col("num_sem"))
+        .withColumn(
             "is_summer_trough",
             ((F.col("num_sem") >= 30) & (F.col("num_sem") <= 35)).cast("tinyint"),
         )
@@ -196,6 +272,8 @@ def _build_feature_frame(panel, articles_enc, agences_enc, fac, history_end_week
             "is_xmas_trough",
             ((F.col("num_sem") >= 50) | (F.col("num_sem") == 1)).cast("tinyint"),
         )
+        .withColumn("is_q1", (F.col("quarter_num") == 1).cast("tinyint"))
+        .withColumn("is_q4", (F.col("quarter_num") == 4).cast("tinyint"))
     )
 
     # --- 8. Join the small silver dims -------------------------------------

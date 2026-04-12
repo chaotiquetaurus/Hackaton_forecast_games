@@ -21,7 +21,7 @@
 # -----------------------------------------------------------------------------
 # Team identity & submission table
 # -----------------------------------------------------------------------------
-NOM_EQUIPE = "télécacaton"
+NOM_EQUIPE = "telecacaton"
 TABLE_PREDICTIONS = f"workspace.default.predictions_equipe_{NOM_EQUIPE}"
 
 # -----------------------------------------------------------------------------
@@ -140,7 +140,15 @@ FEATURES_NUMERIC = [
     "roll_median_4", "roll_median_13",
     # --- Zero rates & trend ---
     "zero_rate_26", "zero_rate_52", "pair_zero_rate_expanding",
+    "active_rate_13", "active_rate_26",
+    "recent_sum_13", "recent_sum_26",
+    "lag_1_is_zero", "lag_2_is_zero",
+    "has_lag_1", "has_lag_13", "has_lag_52",
+    "weeks_since_last_sale", "pair_active_rate_expanding",
     "trend_8", "ratio_n1_vs_mean", "yoy_ratio",
+    "roll_mean_4_vs_13", "roll_mean_13_vs_52",
+    "lag1_vs_roll13", "lag1_minus_roll13",
+    "roll_std_13_ratio", "sem_mean_vs_pair_mean",
     # --- Pair expanding stats ---
     "pair_mean", "pair_median", "pair_max", "pair_count", "pair_cv",
     # --- Same-week-of-year history ---
@@ -155,8 +163,9 @@ FEATURES_NUMERIC = [
     "fac_prix_unit", "fac_pct_pro", "fac_nb_chantiers", "fac_nb_achats",
     # --- Temporal ---
     "annee", "num_sem", "sin_sem", "cos_sem",
+    "month_num", "quarter_num", "weeks_to_year_end",
     # --- Calendar flags ---
-    "is_summer_trough", "is_xmas_trough",
+    "is_summer_trough", "is_xmas_trough", "is_q1", "is_q4",
 ]
 
 FEATURES_CATEGORICAL = [
@@ -192,17 +201,15 @@ LGB_PARAMS_ZERO = {
     "seed": SEED,
     "verbose": -1,
 }
-LGB_NUM_ROUNDS_ZERO = 3000
+LGB_NUM_ROUNDS_ZERO = 600
 LGB_EARLY_STOP_ZERO = 75
 
 # -----------------------------------------------------------------------------
 # LightGBM hyperparameters — Stage 2: quantity regressor
 # -----------------------------------------------------------------------------
-# Tweedie is a strong default for zero-heavy non-negative targets; we still
-# train on log1p(quantite) because the evaluation pipeline tries both and
-# picks the lower-WAPE variant. Sample weights are proportional to the
-# quantity itself so the regressor focuses on high-volume pairs — the same
-# pairs that dominate WAPE.
+# The training notebook overrides the objective to regression_l1 and fits raw
+# positive quantities. This keeps the model aligned with WAPE while the config
+# still keeps the other tree-shape knobs in one place.
 LGB_PARAMS_QTY = {
     "objective": "tweedie",
     "tweedie_variance_power": 1.5,
@@ -220,8 +227,23 @@ LGB_PARAMS_QTY = {
     "seed": SEED,
     "verbose": -1,
 }
-LGB_NUM_ROUNDS_QTY = 5000
+LGB_NUM_ROUNDS_QTY = 800
 LGB_EARLY_STOP_QTY = 100
+
+# ---------------------------------------------------------------------------
+# Iterative early stopping / scoring
+# ---------------------------------------------------------------------------
+# The model is trained on fully known train rows, but validation/test/final
+# WAPE are scored as recursive block forecasts: after each week, predictions
+# are fed back into the lag/rolling features for the next week.
+ITERATIVE_FEED_ROUNDED = True
+ITERATIVE_EARLY_STOP_PATIENCE = 3
+ITERATIVE_EARLY_STOP_MIN_DELTA = 1e-4
+WARMUP_QTY_ROUNDS_FOR_ZERO = 150
+ZERO_ITER_CHECKPOINTS = [50, 100, 150, 200, 300, 450, 600]
+QTY_ITER_CHECKPOINTS = [50, 100, 150, 200, 300, 450, 600, 800]
+ITERATIVE_EARLY_STOP_THRESHOLD_GRID = [0.55]
+PREDICTION_BLEND_ALPHA_GRID = [0.0, 0.20, 0.35]
 
 # -----------------------------------------------------------------------------
 # Zero threshold search
@@ -230,7 +252,7 @@ LGB_EARLY_STOP_QTY = 100
 # zero classifier. Anything above it is forced to zero. The threshold that
 # minimises WAPE on validation is persisted as an MLflow parameter and read
 # back at inference time.
-ZERO_THRESHOLD_GRID = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+ZERO_THRESHOLD_GRID = [0.50, 0.55]
 
 # -----------------------------------------------------------------------------
 # Echo

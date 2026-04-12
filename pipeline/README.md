@@ -99,17 +99,18 @@ train/test boundary has leaked.
 
 - **Two-stage hurdle model:**
   - *Stage 1* — binary LightGBM classifies `P(quantite = 0)`.
-  - *Stage 2* — LightGBM regressor on `log1p(quantite)` trained **only on
-    rows where `quantite > 0`**, sample-weighted by `quantite`.
-- **Combining rule:** `pred = 0 if p_zero > threshold else expm1(reg_pred)`.
-  The threshold is grid-searched on validation WAPE and persisted in MLflow.
+  - *Stage 2* — LightGBM regressor on raw `quantite`, trained **only on
+    rows where `quantite > 0`** with a WAPE-aligned MAE objective.
+- **Combining rule:** `pred = 0 if p_zero > threshold else reg_pred`.
+  The threshold and a small seasonal blend are tuned on blind iterative
+  validation WAPE and persisted in MLflow.
 - **Dead pairs** (74 pairs with 100% zero history) are short-circuited to 0
   at inference — the `is_dead_pair` flag is propagated from silver to gold
   in DLT so inference needs no extra lookup.
-- **Lag handling at inference:** W27..W52 is predicted in one shot, so
-  lags 1..25 are null. They are imputed with the pair's training-period
-  expanding mean; longer lags (26, 52, 104) come directly from the feature
-  table.
+- **Lag handling at validation/test/inference:** horizons are scored
+  recursively. After each predicted week, the prediction is fed back into the
+  in-memory history and the next week's lags, rolling stats, zero/activity
+  rates and recency features are rebuilt from that history.
 
 ## Temporal splits
 

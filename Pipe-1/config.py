@@ -42,7 +42,15 @@ FEATURES_NUMERIC = [
     "roll_std_4", "roll_std_8", "roll_std_13", "roll_std_26", "roll_std_52",
     "roll_median_4", "roll_median_13",
     "zero_rate_26", "zero_rate_52", "pair_zero_rate_expanding",
+    "active_rate_13", "active_rate_26",
+    "recent_sum_13", "recent_sum_26",
+    "lag_1_is_zero", "lag_2_is_zero",
+    "has_lag_1", "has_lag_13", "has_lag_52",
+    "weeks_since_last_sale", "pair_active_rate_expanding",
     "trend_8", "ratio_n1_vs_mean", "yoy_ratio",
+    "roll_mean_4_vs_13", "roll_mean_13_vs_52",
+    "lag1_vs_roll13", "lag1_minus_roll13",
+    "roll_std_13_ratio", "sem_mean_vs_pair_mean",
     "pair_mean", "pair_median", "pair_max", "pair_count", "pair_cv",
     "sem_mean", "sem_max", "sem_median",
     "agence_mean", "agence_median",
@@ -50,7 +58,8 @@ FEATURES_NUMERIC = [
     "n_active_weeks",
     "fac_prix_unit", "fac_pct_pro", "fac_nb_chantiers", "fac_nb_achats",
     "annee", "num_sem", "sin_sem", "cos_sem",
-    "is_summer_trough", "is_xmas_trough",
+    "month_num", "quarter_num", "weeks_to_year_end",
+    "is_summer_trough", "is_xmas_trough", "is_q1", "is_q4",
 ]
 
 FEATURES_CATEGORICAL = [

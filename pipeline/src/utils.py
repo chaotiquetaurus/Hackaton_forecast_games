@@ -4,7 +4,7 @@ Shared utilities for the Saint-Gobain Distribution (SGDB) forecasting pipeline.
 This module is imported by every notebook in the pipeline. Keep it:
 - pure-Python where possible
 - stateless (no implicit globals)
-- Databricks-friendly (only depends on pyspark + numpy + pandas)
+- Databricks-friendly (only depends on pyspark + numpy)
 
 The functions here handle the two concerns that recur everywhere:
   1. Parsing and arithmetic on the "YYYY-WW" `semaine` string.
@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import Iterable
 
 import numpy as np
-import pandas as pd
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 
@@ -64,10 +63,6 @@ def wape_numpy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
     return float(np.sum(np.abs(y_true - y_pred)) / (np.sum(np.abs(y_true)) + EPS))
-
-
-def wape_pandas(df: pd.DataFrame, y_col: str, pred_col: str) -> float:
-    return wape_numpy(df[y_col].to_numpy(), df[pred_col].to_numpy())
 
 
 def wape_spark(df: DataFrame, y_col: str = "quantite", pred_col: str = "prediction") -> float:

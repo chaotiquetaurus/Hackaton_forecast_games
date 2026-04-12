@@ -175,24 +175,6 @@ print(f"Mean predicted : {final_int.mean():.3f}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### eNZO Test
-
-# COMMAND ----------
-
-
-NOM_EQUIPE = "telecacaton"   # ← remplacez par le nom de votre équipe
-
-# Ne touchez pas au reste
-TABLE_PREDICTIONS = f"workspace.default.predictions_equipe_{NOM_EQUIPE}"
-print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
-
-# COMMAND ----------
-
-
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## 6. Write final predictions
 
 # COMMAND ----------
@@ -231,7 +213,7 @@ with mlflow.start_run(run_name="inference"):
     mlflow.log_param("zero_threshold", best_threshold)
     mlflow.log_param("zero_clf_version", v_zero)
     mlflow.log_param("qty_reg_version", v_qty)
-    mlflow.log_metric("n_test_rows", len(out_df))
+    mlflow.log_metric("n_test_rows", len(test_df))
     mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
     mlflow.log_metric("mean_pred", float(final_int.mean()))
 

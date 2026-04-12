@@ -108,14 +108,20 @@ The target is highly skewed: **67% of observations are zero**, the mean is 10.5 
 ## Repository Structure
 
 ```
-├── README.md                   # This file
-├── Rapport_EDA_SGDB_2026.md    # Full exploratory data analysis report
-├── notebooks/
-│   ├── 01_eda.py               # Exploratory analysis
-│   ├── 02_feature_engineering.py
-│   ├── 03_training.py
-│   └── 04_inference.py
-└── src/                        # Reusable modules
+├── README.md                        # This file
+├── Rapport_EDA_SGDB_2026.md         # Full exploratory data analysis report
+├── lakeflow/                        # Databricks DLT pipeline (feature engineering)
+│   ├── config.py                    # DLT-specific configuration
+│   └── transformations/
+│       ├── bronze/bronze_tables.py  # Raw table passthrough
+│       ├── silver/silver_tables.py  # Cleaning, enrichment, panel expansion
+│       └── gold/gold_tables.py      # ML-ready feature table + train/val/test splits
+├── pipeline/                        # ML notebooks (run on Databricks)
+│   ├── 00_config.py                 # Single source of truth (tables, splits, hyperparams)
+│   ├── 03_train_model.py            # Two-stage LightGBM (zero clf + qty regressor)
+│   ├── 04_evaluate.py               # Validation WAPE, baselines, confusion matrix
+│   ├── 05_inference.py              # Score test period + write submission
+│   └── src/utils.py                 # Shared utilities (WAPE, windows, encoders)
 ```
 
 ---

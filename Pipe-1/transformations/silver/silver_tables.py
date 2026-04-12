@@ -306,6 +306,8 @@ def silver_facturation_lagged():
             "fac_pct_pro",
             F.col("fac_nb_chantiers").cast("double"),
             F.col("fac_nb_achats").cast("double"),
+            F.col("_sum_quantite").cast("double").alias("fac_sum_quantite"),
+            F.col("_sum_montant").cast("double").alias("fac_sum_montant"),
         )
     )
 

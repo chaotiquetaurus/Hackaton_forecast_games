@@ -187,16 +187,33 @@ print(f"Votre table de prédictions : {TABLE_PREDICTIONS}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Write final predictions
+# MAGIC ## 6. Write final predictions to Delta and display for download
 
 # COMMAND ----------
 
 import base64
 
-out_sdf = spark.table("workspace.default.predictions_final")
+predictions_pd = test_df[["semaine", "code_agence", "code_article"]].copy()
+predictions_pd["quantite"] = final_int
+
+predictions_sdf = (
+    spark.createDataFrame(predictions_pd)
+    .withColumn("code_agence",  F.col("code_agence").cast(LongType()))
+    .withColumn("code_article", F.col("code_article").cast(LongType()))
+    .withColumn("quantite",     F.col("quantite").cast(LongType()))
+)
+
+(
+    predictions_sdf.write
+    .format("delta").mode("overwrite").option("overwriteSchema", "true")
+    .saveAsTable(TBL_PREDICTIONS_FINAL)
+)
+print(f"Wrote {TBL_PREDICTIONS_FINAL}")
+
+out_sdf = spark.table(TBL_PREDICTIONS_FINAL)
 print(f"{out_sdf.count():,} rows")
 
-# Write full CSV for download
+# CSV download link
 out_pd = out_sdf.toPandas()
 csv_bytes = out_pd.to_csv(index=False).encode("utf-8")
 b64 = base64.b64encode(csv_bytes).decode("utf-8")
@@ -211,25 +228,10 @@ display(out_sdf)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 7. CSV export for manual submission
-
-# COMMAND ----------
-
-print("Predictions already saved to Delta table — CSV export skipped (DBFS not available on serverless).")
-print(f"Query your predictions with: SELECT * FROM {TABLE_PREDICTIONS}")
-
-# COMMAND ----------
-
 with mlflow.start_run(run_name="inference"):
     mlflow.log_param("zero_threshold", best_threshold)
     mlflow.log_param("zero_clf_version", v_zero)
     mlflow.log_param("qty_reg_version", v_qty)
-    mlflow.log_metric("n_test_rows", len(out_df))
+    mlflow.log_metric("n_test_rows", len(test_df))
     mlflow.log_metric("n_positive_preds", int((final_int > 0).sum()))
     mlflow.log_metric("mean_pred", float(final_int.mean()))
-
-# COMMAND ----------
-
-# Leaderboard submission skipped — no permissions on predictions_equipe table
-print("Download the CSV from the table above instead.")

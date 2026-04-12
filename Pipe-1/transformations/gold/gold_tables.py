@@ -411,8 +411,8 @@ def gold_feature_table():
     df = (
         df
         .withColumn("fac_achats_roll6",   F.sum("fac_nb_achats").over(fac_w))
-        .withColumn("fac_qty_roll6",      F.sum(F.col("fac_nb_achats") * F.col("fac_prix_unit")).over(fac_w))
-        .withColumn("fac_montant_roll6",  F.sum(F.col("fac_prix_unit")).over(fac_w))
+        .withColumn("fac_qty_roll6",      F.sum("fac_sum_quantite").over(fac_w))
+        .withColumn("fac_montant_roll6",  F.sum("fac_sum_montant").over(fac_w))
         .withColumn(
             "fac_pct_pro_roll6",
             F.avg("fac_pct_pro").over(fac_w),

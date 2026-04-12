@@ -187,7 +187,7 @@ def silver_ventes():
 
 @dp.materialized_view(
     name="silver_articles_encoded",
-    comment="Article reference with label-encoded specialite / famille / marque / mdd.",
+    comment="Article reference with label-encoded categoricals.",
     table_properties={"quality": "silver"},
 )
 @dp.expect_or_fail("articles_unique_pair", "code_agence IS NOT NULL AND code_article IS NOT NULL")
@@ -197,8 +197,12 @@ def silver_articles_encoded():
     mapping = [
         ("specialite", "art_specialite_enc"),
         ("famille", "art_famille_enc"),
+        ("sous_famille", "art_sous_famille_enc"),
         ("marque", "art_marque_enc"),
         ("article_mdd", "art_mdd_enc"),
+        ("unite_vente", "art_unite_vente_enc"),
+        ("Gamme", "art_gamme_enc"),
+        ("code_fournisseur", "art_fournisseur_enc"),
     ]
     for src, dst in mapping:
         df = _encode_column(df, src, dst)
@@ -209,7 +213,7 @@ def silver_articles_encoded():
 
 @dp.materialized_view(
     name="silver_agences_encoded",
-    comment="Agency reference with label-encoded region.",
+    comment="Agency reference with label-encoded region, departement, ville.",
     table_properties={"quality": "silver"},
 )
 def silver_agences_encoded():
@@ -218,7 +222,11 @@ def silver_agences_encoded():
     src = "region" if "region" in df.columns else "ag_region"
     df = df.withColumnRenamed(src, "ag_region")
     df = _encode_column(df, "ag_region", "ag_region_enc")
-    return df.select("code_agence", "ag_region_enc").dropDuplicates(["code_agence"])
+    df = _encode_column(df, "departement", "ag_departement_enc")
+    df = _encode_column(df, "ville", "ag_ville_enc")
+    return df.select(
+        "code_agence", "ag_region_enc", "ag_departement_enc", "ag_ville_enc",
+    ).dropDuplicates(["code_agence"])
 
 
 # ---------------------------------------------------------------------------

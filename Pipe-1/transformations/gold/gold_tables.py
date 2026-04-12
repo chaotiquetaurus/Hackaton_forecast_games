@@ -429,13 +429,16 @@ def gold_feature_table():
         "is_anomaly", "is_capped", "is_dead_pair",
     ]
 
-    # Collect every feature column we generated; also pull annee/num_sem
-    # which are needed by the split filters and prepare_features.
+    # Collect every feature column we generated; also pull annee which is
+    # needed by the split filters.  num_sem is already a feature column
+    # (it came from silver_panel) so it's included automatically.
     feature_cols = [c for c in df.columns if c not in base_cols
                     and not c.startswith("_")
-                    and c not in ("y", "annee")]
+                    and c not in ("y",)]
 
-    return df.select(*base_cols, "annee", "num_sem", *feature_cols)
+    # Deduplicate (annee/num_sem may already be in feature_cols).
+    all_cols = list(dict.fromkeys(base_cols + feature_cols))
+    return df.select(*all_cols)
 
 
 # ---------------------------------------------------------------------------

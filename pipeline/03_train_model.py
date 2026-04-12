@@ -60,9 +60,13 @@ mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
 # COMMAND ----------
 
+# `detrended_lag52` and `demand_profile` are computed by prepare_features()
+# in pandas, not materialised in the gold table — exclude them from the
+# Spark select.
+_DERIVED_FEATURES = {"detrended_lag52", "demand_profile"}
 cols_needed = (
     ["semaine", "code_agence", "code_article", "week_id", "quantite", "is_dead_pair"]
-    + FEATURES
+    + [f for f in FEATURES if f not in _DERIVED_FEATURES]
 )
 
 train_sdf = spark.table(TBL_GOLD_TRAIN).select(*cols_needed)

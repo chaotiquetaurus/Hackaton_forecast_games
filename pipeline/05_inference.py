@@ -111,7 +111,12 @@ print(f"Loaded zero_classifier v{v_zero}, qty_regressor v{v_qty}")
 
 # COMMAND ----------
 
-feature_cols = ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"] + FEATURES
+# Exclude derived features computed by prepare_features() in pandas.
+_DERIVED_FEATURES = {"detrended_lag52", "demand_profile"}
+feature_cols = (
+    ["semaine", "code_agence", "code_article", "week_id", "is_dead_pair"]
+    + [f for f in FEATURES if f not in _DERIVED_FEATURES]
+)
 
 test_features_sdf = spark.table(TBL_GOLD_TEST).select(*feature_cols)
 

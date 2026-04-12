@@ -39,13 +39,13 @@ TBL_FACTURATION = "workspace.default.donnees_facturation"
 # These live in `workspace.default` and are materialised by
 # `pipeline_lakeflow.py`. Downstream notebooks read from them with
 # `spark.table(...)`.
-TBL_SILVER_VENTES = "workspace.default.silver_ventes"
-TBL_SILVER_PANEL = "workspace.default.silver_panel"
-TBL_GOLD_FEATURES = "workspace.default.gold_feature_table"
-TBL_GOLD_TRAIN = "workspace.default.gold_train"
-TBL_GOLD_VAL = "workspace.default.gold_validation"
-TBL_GOLD_INTERNAL_TEST = "workspace.default.gold_internal_test"
-TBL_GOLD_FINAL_INFERENCE = "workspace.default.gold_test_features"
+TBL_SILVER_VENTES = "workspace.default.p2_silver_ventes"
+TBL_SILVER_PANEL = "workspace.default.p2_silver_panel"
+TBL_GOLD_FEATURES = "workspace.default.p2_gold_feature_table"
+TBL_GOLD_TRAIN = "workspace.default.p2_gold_train"
+TBL_GOLD_VAL = "workspace.default.p2_gold_validation"
+TBL_GOLD_INTERNAL_TEST = "workspace.default.p2_gold_internal_test"
+TBL_GOLD_FINAL_INFERENCE = "workspace.default.p2_gold_test_features"
 # Backward-compatible alias. This table is the hidden final-inference horizon,
 # not the labelled internal test set.
 TBL_GOLD_TEST = TBL_GOLD_FINAL_INFERENCE

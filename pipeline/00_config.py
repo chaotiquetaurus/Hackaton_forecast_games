@@ -117,41 +117,66 @@ ROLLING_MEDIAN_WINDOWS = [4, 13]
 # Keep this list flat. Every string here must be present in the feature table
 # built by 02_feature_engineering.py. The training notebook asserts this.
 FEATURES_NUMERIC = [
-    # --- Lags ---
-    "lag_1", "lag_2", "lag_4", "lag_8", "lag_13", "lag_26", "lag_52", "lag_104",
-    # --- Rolling mean ---
-    "roll_mean_4", "roll_mean_8", "roll_mean_13", "roll_mean_26", "roll_mean_52",
-    # --- Rolling std ---
-    "roll_std_4", "roll_std_8", "roll_std_13", "roll_std_26", "roll_std_52",
-    # --- Rolling median (robust) ---
-    "roll_median_4", "roll_median_13",
-    # --- Zero rates & trend ---
-    "zero_rate_26", "zero_rate_52", "pair_zero_rate_expanding",
-    "trend_8", "ratio_n1_vs_mean", "yoy_ratio",
-    # --- Pair expanding stats ---
-    "pair_mean", "pair_median", "pair_max", "pair_count", "pair_cv",
+    # --- Lags (inference-safe: >= 26) ---
+    "lag_27", "lag_52", "lag_104",
+    # --- Pair stats lag26 (inference-safe expanding stats) ---
+    "pair_mean_lag26", "pair_median_lag26", "pair_max_lag26", "pair_min_lag26",
+    "pair_std_lag26", "pair_cv_lag26",
+    "pair_zero_rate_lag26", "pair_active_weeks_lag26",
+    "pair_nonzero_mean_lag26", "pair_nonzero_share_lag26",
+    "pair_last_nonzero_gap",
+    # --- Ratios & trends ---
+    "ratio_lag52_vs_pair_mean_lag26",
+    "ratio_band26_52_vs_pair_mean_lag26",
+    "trend_band_26_52_vs_52_104",
+    "yoy_ratio",
+    # --- Band features (inference-safe windowed aggregates) ---
+    "band_mean_27_52",
+    "band_std_26_52",
+    "band_nonzero_mean_26_52", "band_nonzero_mean_52_104",
+    "band_cv_26_52", "band_cv_27_52", "band_cv_39_65",
+    "band_cv_52_104", "band_cv_78_104", "band_cv_104_156",
+    "band_zero_rate_27_52", "band_zero_rate_39_65",
+    "band_zero_rate_52_78", "band_zero_rate_52_104",
+    "band_active_count_52_104", "band_active_count_104_156",
     # --- Same-week-of-year history ---
-    "sem_mean", "sem_max", "sem_median",
-    # --- Agency expanding stats ---
-    "agence_mean", "agence_median",
-    # --- Article expanding stats ---
-    "article_mean", "article_median",
-    # --- Activity ---
-    "n_active_weeks",
-    # --- Billing-derived (monthly granularity, lagged 2 months) ---
-    "fac_prix_unit", "fac_pct_pro", "fac_nb_chantiers", "fac_nb_achats",
+    "sem_nonzero_mean", "sem_zero_rate",
+    # --- Agency stats lag26 ---
+    "agence_mean_lag26", "agence_zero_rate_lag26", "agence_nonzero_mean_lag26",
+    # --- Article stats lag26 ---
+    "article_mean_lag26", "article_zero_rate_lag26", "article_nonzero_mean_lag26",
+    # --- Billing-derived (rolling 6-month, lagged) ---
+    "fac_nb_achats", "fac_achats_roll6",
+    "fac_qty_roll6", "fac_montant_roll6", "fac_pct_pro_roll6",
+    # --- Derived (computed by prepare_features in src/utils.py) ---
+    "detrended_lag52",
     # --- Temporal ---
-    "annee", "num_sem", "sin_sem", "cos_sem",
+    "num_sem", "trimestre", "mois_approx", "week_of_quarter",
+    "sin_sem", "cos_sem",
+    "sin_sem_2", "cos_sem_2",
+    "sin_sem_3", "cos_sem_3",
+    "sin_sem_4", "cos_sem_4",
     # --- Calendar flags ---
     "is_summer_trough", "is_xmas_trough",
+    "is_august", "is_december",
+    "is_quarter_end", "is_peak_spring", "is_peak_autumn",
+    "weeks_to_summer", "weeks_to_xmas",
 ]
 
 FEATURES_CATEGORICAL = [
     "art_specialite_enc",
     "art_famille_enc",
+    "art_sous_famille_enc",
     "art_marque_enc",
     "art_mdd_enc",
+    "art_unite_vente_enc",
+    "art_gamme_enc",
+    "art_fournisseur_enc",
     "ag_region_enc",
+    "ag_departement_enc",
+    "ag_ville_enc",
+    # Derived (computed by prepare_features in src/utils.py)
+    "demand_profile",
 ]
 
 FEATURES = FEATURES_NUMERIC + FEATURES_CATEGORICAL
@@ -218,6 +243,112 @@ LGB_EARLY_STOP_QTY = 100
 # minimises WAPE on validation is persisted as an MLflow parameter and read
 # back at inference time.
 ZERO_THRESHOLD_GRID = [0.30, 0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+
+# -----------------------------------------------------------------------------
+# Ensemble / stacking additions (new model pipeline)
+# -----------------------------------------------------------------------------
+# These blocks are consumed exclusively by `03_train_model.py` and
+# `05_inference.py`. They have no effect on the feature engineering layer.
+
+# Multi-seed ensembling. Each listed seed trains one extra LGB clf / LGB reg /
+# XGB reg, and predictions are averaged before stacking. Default is a single
+# seed (fast); bump to `[42, 1337, 2024]` for the final run — cost scales
+# linearly with len(ENSEMBLE_SEEDS).
+ENSEMBLE_SEEDS = [SEED]
+
+# XGBoost regressor — diversity term in the ensemble. Objective matches LGB
+# (absolute error / MAE) so both models produce predictions on the same
+# scale and the Ridge stacker can blend them without bias correction.
+# reg:absoluteerror is available in XGBoost >= 2.1 (currently pinned 2.1.3).
+XGB_PARAMS_QTY = {
+    "objective":              "reg:absoluteerror",
+    "eval_metric":            "mae",
+    "learning_rate":          0.03,
+    "max_depth":              8,
+    "min_child_weight":       10.0,
+    "subsample":              0.8,
+    "colsample_bytree":       0.8,
+    "reg_alpha":              0.1,
+    "reg_lambda":             1.0,
+    "gamma":                  0.0,
+    "verbosity":              0,
+    "nthread":                -1,
+    "seed":                   SEED,
+}
+XGB_NUM_ROUNDS_QTY = 5000
+XGB_EARLY_STOP_QTY = 100
+XGB_MIN_DELTA_QTY  = 1e-3
+
+# NOTE — sample weights were tried for WAPE alignment (§5.6 of the report)
+# but produced catastrophic predictions on Tweedie: variance∝μ^p already
+# weights high-volume rows, so sample_weight=y double-counts and makes the
+# model systematically over-predict (val WAPE >3 instead of <1). Dropped.
+# If you want WAPE-aligned weighting, switch the objective to regression_l1
+# first — MAE is homoscedastic and accepts y-proportional weights cleanly.
+
+# Ridge stacker — blends (lgb_pred, xgb_pred, lag_52, pair_mean, pair_median).
+# `positive=True` and `fit_intercept=False` preserve zero-homogeneity and
+# keep every meta-weight non-negative.
+#
+# USE_STACKER toggle: when False, `blend = lgb_val_avg` directly (XGB and the
+# baselines are skipped at blend time, though both models still train so the
+# artifacts keep the same shape).
+#
+# DEFAULT = False because Ridge minimises MSE while the MAE-trained
+# regressors predict the conditional MEDIAN. On right-skewed retail
+# targets (mean/median ratio ~1.5) the Ridge systematically rescales LGB
+# by that ratio, which forces the adaptive threshold into max-aggressive
+# gating (kills ~78% of real sales) to recover. Net result on this data:
+# final WAPE 0.92 with stacker vs ~0.80-0.85 expected without. Bypassing
+# is correct here; flip to True only if you fix the objective mismatch
+# (e.g. switch the Ridge to an L1-minimising blend, or retrain models to
+# predict the mean).
+USE_STACKER = False
+STACK_BASELINE_COLS = ["lag_52", "pair_mean_lag26", "pair_median_lag26"]
+STACKING_RIDGE_ALPHA = 0.5
+
+# Stacker fit strategy.
+#
+# - 0 (default) → fit Ridge on validation predictions from the main models.
+#                 This matches the Fourth-good-model notebook and is the
+#                 ROBUST choice when train spans multiple years with regime
+#                 shifts (2020-2024 here). Minimal overfit risk: 5 features
+#                 on ~85k non-zero rows.
+# - >= 2        → TimeSeriesSplit OOF on the training set (was the default
+#                 briefly). AVOID unless train is stationary: on this dataset,
+#                 OOF folds train on earlier, calmer periods and the fold
+#                 models under-predict vs the full-train model → Ridge learns
+#                 a 1.22x correction that then over-amplifies the main-model
+#                 predictions on val, blowing WAPE from ~0.80 to ~0.91.
+STACKING_OOF_FOLDS = 0
+
+# Isotonic calibration of the zero classifier. Fitted on validation probas
+# vs actual `is_zero`, applied at inference to stabilise the adaptive threshold.
+CALIBRATE_ZERO_CLF = True
+
+# Adaptive zero threshold: thr(row) = clip(base - slope * pair_zero_rate, clip_lo, clip_hi).
+# Products with a high historical zero-rate get a lower threshold (more
+# aggressive zeroing). The (base, slope) pair is picked by a small grid
+# sweep on val WAPE — NOT a full hyperparameter search.
+# Base grid widened up to 0.80 because the pre-bypass runs systematically
+# hit the lowest corner (0.40) — that was a symptom of stacker over-scaling,
+# not a genuinely better threshold. With USE_STACKER=False the expectation
+# is the optimum lands around 0.55-0.70.
+ADAPTIVE_THRESHOLD_BASE_GRID  = [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+ADAPTIVE_THRESHOLD_SLOPE_GRID = [0.00, 0.05, 0.10, 0.15, 0.20]
+ADAPTIVE_THRESHOLD_CLIP       = (0.15, 0.90)
+ZERO_RATE_FEATURE             = "pair_zero_rate_lag26"
+
+# Hard override: pairs flagged `is_dead_pair == 1` are forced to zero after
+# blending. Belt-and-braces on top of the classifier; cheap and safe.
+DEAD_PAIR_FORCE_ZERO = True
+
+# MLflow artifact folder name. The training notebook writes all models +
+# stacker + calibrator + a `manifest.json` under this sub-path; inference
+# downloads the same folder and rebuilds the pipeline in-process. This
+# replaces the Model Registry flow for the ensemble case because the
+# Registry does not elegantly represent k-model ensembles.
+MLFLOW_ENSEMBLE_ARTIFACT_PATH = "ensemble"
 
 # -----------------------------------------------------------------------------
 # Echo

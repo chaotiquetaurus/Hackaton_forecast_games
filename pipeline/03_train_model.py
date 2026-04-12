@@ -43,7 +43,7 @@ from mlflow.models import infer_signature
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType, DoubleType, StringType, StructField, StructType
 
-from src.utils import wape_numpy, wape_lgb_feval
+from src.utils import wape_numpy, wape_lgb_feval, prepare_features
 
 # COMMAND ----------
 
@@ -75,6 +75,21 @@ print(f"Train: {len(train_pd):,}   Val: {len(val_pd):,}")
 
 # Double-check the split has no overlap.
 assert train_pd["week_id"].max() < val_pd["week_id"].min(), "Temporal split broken"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1b. Feature preparation (clipping + derived features)
+# MAGIC
+# MAGIC `prepare_features` clips extreme ratio/CV values to prevent overfit on
+# MAGIC pathological splits, caps `pair_last_nonzero_gap` at 104 weeks, and adds
+# MAGIC two derived features: `detrended_lag52` (trend-corrected YoY lag) and
+# MAGIC `demand_profile` (Syntetos-Boylan 4-class categorisation).
+
+# COMMAND ----------
+
+train_pd = prepare_features(train_pd)
+val_pd   = prepare_features(val_pd)
 
 # COMMAND ----------
 

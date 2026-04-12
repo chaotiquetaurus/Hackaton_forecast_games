@@ -2,7 +2,7 @@ from pyspark import pipelines as dp
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-from config import PAIR_KEYS, ANOMALY_ROLL_WINDOW, ANOMALY_MULTIPLIER
+from config import PAIR_KEYS, ANOMALY_ROLL_WINDOW, ANOMALY_MAD_ZSCORE
 
 
 # ============================================================================
@@ -39,8 +39,8 @@ def _encode_column(df, src, dst):
 @dp.materialized_view(
     name="silver_ventes",
     comment=(
-        "Cleaned sales history: per-pair P99.5 outlier cap, 10x-rolling-median "
-        "anomaly imputation, EMA smoothing, and a dead-pair flag."
+        "Cleaned sales history: per-pair P99.5 outlier cap, MAD z-score "
+        "anomaly clipping (z>3.5), EMA smoothing, and a dead-pair flag."
     ),
     table_properties={"quality": "silver"},
 )
@@ -92,7 +92,12 @@ def silver_ventes():
         )
     )
 
-    # 3. Rolling-median anomaly detection (strictly past window).
+    # 3. MAD-based anomaly detection (strictly past window).
+    #    z_mad = |x - median| / (1.4826 * MAD)   where MAD = median(|x - median|)
+    #    1.4826 makes the MAD consistent with the standard deviation for a
+    #    Gaussian, but the z-score is valid for any distribution.
+    #    Anomalous values are CLIPPED (not replaced) to median + z * MAD_scaled,
+    #    preserving the direction of trend spikes instead of crushing them flat.
     roll_w = (
         Window.partitionBy(*PAIR_KEYS)
         .orderBy("week_id")
@@ -104,22 +109,49 @@ def silver_ventes():
             "_roll_median",
             F.expr("percentile_approx(quantite_capped, 0.5)").over(roll_w),
         )
+        # MAD = median(|x_i - median|) over the same window.
+        .withColumn(
+            "_abs_dev",
+            F.abs(F.col("quantite_capped") - F.col("_roll_median")),
+        )
+        .withColumn(
+            "_roll_mad",
+            F.expr("percentile_approx(_abs_dev, 0.5)").over(roll_w),
+        )
+        # Scaled MAD: 1.4826 × MAD. Floor at 1.0 so that constant-value
+        # series (MAD=0) still have a usable denominator.
+        .withColumn(
+            "_mad_scaled",
+            F.greatest(F.col("_roll_mad") * F.lit(1.4826), F.lit(1.0)),
+        )
+        .withColumn(
+            "_z_mad",
+            F.when(
+                F.col("_roll_median").isNotNull(),
+                F.col("_abs_dev") / F.col("_mad_scaled"),
+            ),
+        )
         .withColumn(
             "is_anomaly",
             (
-                F.col("_roll_median").isNotNull()
+                F.col("_z_mad").isNotNull()
+                & (F.col("_z_mad") > F.lit(ANOMALY_MAD_ZSCORE))
                 & (F.col("_roll_median") > F.lit(0))
-                & (
-                    F.col("quantite_capped")
-                    > F.lit(ANOMALY_MULTIPLIER) * F.col("_roll_median")
-                )
             ).cast("tinyint"),
+        )
+        # Clip anomalous values instead of replacing: cap at median + threshold × MAD_scaled.
+        .withColumn(
+            "_anomaly_cap",
+            F.col("_roll_median") + F.lit(ANOMALY_MAD_ZSCORE) * F.col("_mad_scaled"),
         )
         .withColumn(
             "quantite",
-            F.when(F.col("is_anomaly") == 1, F.col("_roll_median"))
-             .otherwise(F.col("quantite_capped"))
-             .cast("long"),
+            F.when(
+                F.col("is_anomaly") == 1,
+                F.least(F.col("quantite_capped"), F.col("_anomaly_cap")),
+            )
+            .otherwise(F.col("quantite_capped"))
+            .cast("long"),
         )
     )
 

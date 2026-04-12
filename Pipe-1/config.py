@@ -14,8 +14,15 @@ PAIR_KEYS = ["code_agence", "code_article"]
 
 # Data cleaning knobs
 OUTLIER_PERCENTILE = 0.995
-ANOMALY_MULTIPLIER = 10.0
 ANOMALY_ROLL_WINDOW = 26
+
+# Anomaly detection: MAD-based z-score.
+# A value is anomalous if its z-score (based on the Median Absolute Deviation
+# of the past ANOMALY_ROLL_WINDOW weeks) exceeds this threshold.  Anomalous
+# values are *clipped* (not replaced) to preserve trend direction.
+# The old "ANOMALY_MULTIPLIER × rolling_median" approach was too permissive:
+# it let 9× spikes through on low-volume pairs.
+ANOMALY_MAD_ZSCORE = 3.5
 
 # Feature engineering knobs
 LAGS_ALL = [1, 2, 4, 8, 13, 26, 52, 104]

@@ -197,3 +197,90 @@ def drop_columns_if_exist(df: DataFrame, cols: Iterable[str]) -> DataFrame:
 def nonneg_round(col: Column) -> Column:
     """Clip at zero and round to the nearest non-negative integer."""
     return F.greatest(F.round(col), F.lit(0.0)).cast("long")
+
+
+# ----------------------------------------------------------------------------
+# 6. PANDAS-LEVEL FEATURE PREPARATION (clipping + derived features)
+# ----------------------------------------------------------------------------
+# Called once on each DataFrame (train, val, test, inference) right after
+# toPandas() and before build_xy(). Keeps all clipping / derived-feature
+# logic in a single place so train and inference stay aligned.
+
+# Columns that are ratios (output of division) — clip to [-10, 10].
+_RATIO_COLS = [
+    "ratio_lag52_vs_pair_mean_lag26",
+    "ratio_band26_52_vs_pair_mean_lag26",
+    "trend_band_26_52_vs_52_104",
+    "yoy_ratio",
+]
+
+# Columns that are coefficients of variation — clip to [0, 5].
+_CV_COLS = [
+    "pair_cv_lag26",
+    "band_cv_26_52", "band_cv_27_52", "band_cv_39_65",
+    "band_cv_52_104", "band_cv_78_104", "band_cv_104_156",
+]
+
+
+def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Clip dangerous features and add derived columns (in-place on a copy).
+
+    This function is the single source of truth for post-load feature
+    transforms.  Call it on every pandas DataFrame **before** ``build_xy``.
+
+    Changes applied:
+    1. Clip ratio features to [-10, 10] to prevent extreme-split overfit.
+    2. Clip CV features to [0, 5].
+    3. Clip ``pair_last_nonzero_gap`` to [0, 104].
+    4. Derive ``detrended_lag52`` ��� trend-corrected year-over-year lag.
+    5. Derive ``demand_profile`` — Syntetos-Boylan 4-class categorisation.
+    """
+    df = df.copy()
+
+    # --- 1. Clip ratios -------------------------------------------------------
+    for c in _RATIO_COLS:
+        if c in df.columns:
+            df[c] = df[c].clip(-10.0, 10.0)
+
+    # --- 2. Clip CVs ----------------------------------------------------------
+    for c in _CV_COLS:
+        if c in df.columns:
+            df[c] = df[c].clip(0.0, 5.0)
+
+    # --- 3. Clip pair_last_nonzero_gap ----------------------------------------
+    if "pair_last_nonzero_gap" in df.columns:
+        df["pair_last_nonzero_gap"] = df["pair_last_nonzero_gap"].clip(0, 104)
+
+    # --- 4. detrended_lag52 ---------------------------------------------------
+    # lag_52 corrected for the local trend: what last year's same-week value
+    # would be if the trend were flat.  Uses pair_mean_lag26 (recent level) /
+    # band_nonzero_mean_52_104 (older level) as the trend ratio.
+    if {"lag_52", "pair_mean_lag26", "band_nonzero_mean_52_104"}.issubset(df.columns):
+        denom = df["band_nonzero_mean_52_104"].replace(0.0, np.nan)
+        trend_ratio = (df["pair_mean_lag26"] / denom).clip(0.1, 10.0)
+        df["detrended_lag52"] = (df["lag_52"] * trend_ratio).clip(0.0, None)
+        df["detrended_lag52"] = df["detrended_lag52"].fillna(df["lag_52"])
+    elif "lag_52" in df.columns:
+        # Fallback: no trend correction possible, keep lag_52 as-is.
+        df["detrended_lag52"] = df["lag_52"]
+
+    # --- 5. demand_profile (Syntetos-Boylan 4-class) --------------------------
+    # 0 = SMOOTH        (frequent + regular volume)
+    # 1 = ERRATIC       (frequent + irregular volume)
+    # 2 = INTERMITTENT  (rare + regular volume)
+    # 3 = LUMPY         (rare + irregular volume)
+    # ADI threshold 1.32  →  zero_rate threshold = 1 - 1/1.32 ≈ 0.24
+    # CV² threshold 0.49  →  CV threshold ≈ 0.7
+    if {"pair_zero_rate_lag26", "pair_cv_lag26"}.issubset(df.columns):
+        zr = df["pair_zero_rate_lag26"].fillna(1.0)
+        cv = df["pair_cv_lag26"].fillna(0.0)
+        profile = np.where(
+            zr < 0.24,
+            np.where(cv < 0.7, 0, 1),    # SMOOTH / ERRATIC
+            np.where(cv < 0.7, 2, 3),    # INTERMITTENT / LUMPY
+        )
+        df["demand_profile"] = profile.astype(np.int32)
+    else:
+        df["demand_profile"] = np.int32(3)  # default to LUMPY if inputs missing
+
+    return df

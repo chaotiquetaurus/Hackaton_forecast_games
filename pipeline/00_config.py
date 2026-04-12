@@ -236,6 +236,35 @@ LGB_NUM_ROUNDS_QTY = 5000
 LGB_EARLY_STOP_QTY = 100
 
 # -----------------------------------------------------------------------------
+# Optuna hyperparameter tuning
+# -----------------------------------------------------------------------------
+# Turn this off for a quick smoke run. For the final overnight job, keep it on:
+# Optuna first searches better LightGBM parameters on the temporal validation
+# split, then 03_train_model.py retrains the two final stages on the full train.
+RUN_HYPERPARAMETER_TUNING = True
+
+# Trial counts are intentionally asymmetric: the quantity regressor has the
+# largest impact on WAPE once the zero gate is reasonably calibrated.
+OPTUNA_N_TRIALS_ZERO = 50
+OPTUNA_N_TRIALS_QTY = 80
+
+# Optional hard time budgets. Leave as None to use the trial counts above.
+OPTUNA_TIMEOUT_SECONDS_ZERO = None
+OPTUNA_TIMEOUT_SECONDS_QTY = None
+
+# Tuning rounds are shorter than final training rounds to keep search efficient.
+OPTUNA_NUM_ROUNDS_ZERO = 1500
+OPTUNA_NUM_ROUNDS_QTY = 2500
+OPTUNA_EARLY_STOP_ZERO = 50
+OPTUNA_EARLY_STOP_QTY = 80
+
+# The zero classifier sees every row and is the most expensive to tune. A fixed
+# random training sample keeps the search tractable while validation remains
+# full-size and temporal. Set to None to tune on all rows.
+OPTUNA_TUNING_MAX_TRAIN_ROWS_ZERO = 1_000_000
+OPTUNA_TUNING_MAX_TRAIN_ROWS_QTY = None
+
+# -----------------------------------------------------------------------------
 # Zero threshold search
 # -----------------------------------------------------------------------------
 # After both stages run, we sweep the probability threshold applied to the

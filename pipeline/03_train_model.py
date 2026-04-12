@@ -33,16 +33,21 @@
 
 import sys
 sys.path.append("./")
-
+ 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import shap
 import mlflow
 import mlflow.lightgbm
 from mlflow.models import infer_signature
-from pyspark.sql import functions as F
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve, confusion_matrix
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from pyspark.sql.types import LongType, DoubleType, StringType, StructField, StructType
-
+ 
 from src.utils import wape_numpy, wape_lgb_feval
 
 # COMMAND ----------
@@ -70,102 +75,81 @@ val_pd   = spark.table(TBL_GOLD_VAL).select(*cols_needed).toPandas()
  
 assert train_pd["week_id"].max() < val_pd["week_id"].min(), "Temporal split broken"
  
-# Les paires mortes génèrent des zéros structurels qui biaisent le classifieur.
-# On les filtre du train uniquement — le val reste intact pour l'évaluation réelle.
 train_pd = train_pd[train_pd["is_dead_pair"] == 0].reset_index(drop=True)
-print(f"Train (sans paires mortes): {len(train_pd):,}   Val: {len(val_pd):,}")
+print(f"Train: {len(train_pd):,}   Val: {len(val_pd):,}")
+ 
 
 # COMMAND ----------
 
 def add_zero_features(df: pd.DataFrame, ref_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ajoute des features zero-signal calculées sur ref_df (toujours le train).
-    
-    Features ajoutées :
-    - zero_rate_article      : taux de zéro historique par article
-    - zero_rate_agence       : taux de zéro historique par agence
-    - zero_rate_pair         : taux de zéro historique par (agence, article)
-    - consec_zeros_pair      : nb de semaines consécutives à zéro avant la semaine courante
-                               (approximé ici par le zero_rate_pair * nb semaines total)
-    - cv_pair                : coefficient de variation des ventes par paire
-                               (std / mean) — élevé = série très intermittente
-    - zero_rate_pair_recent  : taux de zéro sur les 8 dernières semaines de la paire
-    - weeks_since_last_sale  : nb de semaines depuis la dernière vente (approximé)
-    - is_always_zero_article : 1 si l'article n'a jamais eu de vente dans ref_df
-    """
     df = df.copy()
  
-    # -- Taux de zéro par article
+    # Taux de zéro par article
     art_zero = (
         ref_df.groupby("code_article")["quantite"]
         .apply(lambda x: (x == 0).mean())
-        .rename("zero_rate_article")
-        .reset_index()
+        .rename("zero_rate_article").reset_index()
     )
     df = df.merge(art_zero, on="code_article", how="left")
     df["zero_rate_article"] = df["zero_rate_article"].fillna(0.5)
  
-    # -- Taux de zéro par agence
+    # Taux de zéro par agence
     ag_zero = (
         ref_df.groupby("code_agence")["quantite"]
         .apply(lambda x: (x == 0).mean())
-        .rename("zero_rate_agence")
-        .reset_index()
+        .rename("zero_rate_agence").reset_index()
     )
     df = df.merge(ag_zero, on="code_agence", how="left")
     df["zero_rate_agence"] = df["zero_rate_agence"].fillna(0.5)
  
-    # -- Stats par paire (agence, article)
+    # Stats par paire
     pair_stats = (
         ref_df.groupby(["code_agence", "code_article"])["quantite"]
         .agg(
-            zero_rate_pair   = lambda x: (x == 0).mean(),
-            mean_qty_pair    = "mean",
-            std_qty_pair     = "std",
-            count_pair       = "count",
+            zero_rate_pair = lambda x: (x == 0).mean(),
+            mean_qty_pair  = "mean",
+            std_qty_pair   = "std",
         )
         .reset_index()
     )
     pair_stats["cv_pair"] = (
         pair_stats["std_qty_pair"] / (pair_stats["mean_qty_pair"] + 1e-6)
     ).clip(0, 10)
-    pair_stats["is_always_zero_article"] = (pair_stats["zero_rate_pair"] == 1.0).astype(int)
-    df = df.merge(
-        pair_stats[["code_agence", "code_article",
-                    "zero_rate_pair", "cv_pair", "is_always_zero_article"]],
-        on=["code_agence", "code_article"],
-        how="left",
-    )
-    df["zero_rate_pair"]          = df["zero_rate_pair"].fillna(0.5)
-    df["cv_pair"]                 = df["cv_pair"].fillna(1.0)
-    df["is_always_zero_article"]  = df["is_always_zero_article"].fillna(0)
+    pair_stats["is_always_zero_pair"] = (pair_stats["zero_rate_pair"] == 1.0).astype(int)
  
-    # -- Taux de zéro récent (8 dernières semaines de ref_df par paire)
-    max_week = ref_df["week_id"].max()
-    recent   = ref_df[ref_df["week_id"] >= max_week - 7]
-    recent_zero = (
+    df = df.merge(
+        pair_stats[["code_agence", "code_article", "zero_rate_pair", "cv_pair", "is_always_zero_pair"]],
+        on=["code_agence", "code_article"], how="left",
+    )
+    df["zero_rate_pair"]     = df["zero_rate_pair"].fillna(0.5)
+    df["cv_pair"]            = df["cv_pair"].fillna(1.0)
+    df["is_always_zero_pair"]= df["is_always_zero_pair"].fillna(0)
+ 
+    # Taux de zéro récent (8 dernières semaines)
+    max_week  = ref_df["week_id"].max()
+    recent    = ref_df[ref_df["week_id"] >= max_week - 7]
+    rec_zero  = (
         recent.groupby(["code_agence", "code_article"])["quantite"]
         .apply(lambda x: (x == 0).mean())
-        .rename("zero_rate_pair_recent")
-        .reset_index()
+        .rename("zero_rate_pair_recent").reset_index()
     )
-    df = df.merge(recent_zero, on=["code_agence", "code_article"], how="left")
-    # Si la paire n'a pas de données récentes → on utilise le taux global
+    df = df.merge(rec_zero, on=["code_agence", "code_article"], how="left")
     df["zero_rate_pair_recent"] = df["zero_rate_pair_recent"].fillna(df["zero_rate_pair"])
  
-    # -- Semaines depuis la dernière vente (approximation par week_id)
+    # Semaines depuis la dernière vente
     last_sale = (
         ref_df[ref_df["quantite"] > 0]
         .groupby(["code_agence", "code_article"])["week_id"]
-        .max()
-        .rename("last_sale_week_id")
-        .reset_index()
+        .max().rename("last_sale_week_id").reset_index()
     )
     df = df.merge(last_sale, on=["code_agence", "code_article"], how="left")
     df["weeks_since_last_sale"] = (
         df["week_id"] - df["last_sale_week_id"].fillna(df["week_id"] - 52)
-    ).clip(0, 104)   # cap à 2 ans
+    ).clip(0, 104)
     df = df.drop(columns=["last_sale_week_id"])
+ 
+    # Interaction : paire intermittente ET récemment à zéro
+    df["intermittent_and_recent_zero"] = df["cv_pair"] * df["zero_rate_pair_recent"]
  
     return df
  
@@ -174,16 +158,18 @@ ZERO_FEATURES_ADDED = [
     "zero_rate_agence",
     "zero_rate_pair",
     "cv_pair",
-    "is_always_zero_article",
+    "is_always_zero_pair",
     "zero_rate_pair_recent",
     "weeks_since_last_sale",
+    "intermittent_and_recent_zero",
 ]
  
 train_pd = add_zero_features(train_pd, ref_df=train_pd)
-val_pd   = add_zero_features(val_pd,   ref_df=train_pd)  # ref = train uniquement, pas de fuite
+val_pd   = add_zero_features(val_pd,   ref_df=train_pd)
  
 FEATURES_ZERO = FEATURES + ZERO_FEATURES_ADDED
-print(f"Features classifieur zéro : {len(FEATURES_ZERO)}  (+{len(ZERO_FEATURES_ADDED)} zero-signal)")
+print(f"Features: {len(FEATURES_ZERO)}  (+{len(ZERO_FEATURES_ADDED)} zero-signal)")
+ 
 
 # COMMAND ----------
 
@@ -192,7 +178,7 @@ print(f"Features classifieur zéro : {len(FEATURES_ZERO)}  (+{len(ZERO_FEATURES_
 
 # COMMAND ----------
 
-def build_xy_zero(df: pd.DataFrame, features: list, ref_df: pd.DataFrame = None):
+def build_xy_zero(df, features):
     X = df[features].copy()
     for c in FEATURES_CATEGORICAL:
         if c in X.columns:
@@ -206,44 +192,41 @@ X_va, y_va, z_va = build_xy_zero(val_pd,   FEATURES_ZERO)
  
 print(f"Zero rate — train: {z_tr.mean():.3f}   val: {z_va.mean():.3f}")
  
-# Poids WAPE par article : 1 / (volume_total_article + 1)
-# Évite que les gros articles dominent la loss.
+# Poids par article (WAPE-aligned)
 article_vol = train_pd.groupby("code_article")["quantite"].sum().rename("art_vol")
 train_pd = train_pd.join(article_vol, on="code_article")
 val_pd   = val_pd.join(article_vol,   on="code_article")
 val_pd["art_vol"] = val_pd["art_vol"].fillna(1.0)
  
-w_tr = (1.0 / (train_pd["art_vol"].values + 1.0))
-w_va = (1.0 / (val_pd["art_vol"].values   + 1.0))
+w_tr = 1.0 / (train_pd["art_vol"].values + 1.0)
+w_va = 1.0 / (val_pd["art_vol"].values   + 1.0)
+ 
 
 # COMMAND ----------
 
-n_pos   = int(z_tr.sum())          # nb de zéros (classe positive)
-n_neg   = int((z_tr == 0).sum())   # nb de non-zéros
-spw     = n_neg / max(n_pos, 1)    # scale_pos_weight = ratio non-zero / zero
-print(f"n_zero={n_pos:,}  n_nonzero={n_neg:,}  scale_pos_weight={spw:.3f}")
+n_pos = int(z_tr.sum())
+n_neg = int((z_tr == 0).sum())
+print(f"n_zero={n_pos:,}  n_nonzero={n_neg:,}  ratio={n_neg/n_pos:.2f}")
  
-LGB_PARAMS_ZERO_V2 = {
-    # Objectif
+# Paramètres communs aux deux phases
+BASE_PARAMS = {
     "objective":         "binary",
     "metric":            "binary_logloss",
-    # Capacité du modèle
-    "num_leaves":        255,
-    "max_depth":         -1,
-    "min_child_samples": 50,
+    # Capacité volontairement limitée
+    "num_leaves":        31,
+    "max_depth":         6,
+    "min_child_samples": 200,      # clé anti-overfit
     # Régularisation
-    "reg_alpha":         0.1,
-    "reg_lambda":        1.0,
-    "min_split_gain":    0.01,
-    # Sous-échantillonnage (réduit overfitting + accélère)
-    "subsample":         0.8,
+    "reg_alpha":         1.0,      # L1 fort
+    "reg_lambda":        5.0,      # L2 fort
+    "min_split_gain":    0.1,
+    "min_child_weight":  1e-3,
+    # Bagging agressif
+    "subsample":         0.6,
     "subsample_freq":    1,
-    "colsample_bytree":  0.7,
-    # Déséquilibre de classes
-    "scale_pos_weight":  spw,
+    "colsample_bytree":  0.6,
+    # Pas de scale_pos_weight : géré par les poids sample
     "is_unbalance":      False,
-    # Vitesse / reproductibilité
-    "learning_rate":     0.05,
     "n_jobs":            -1,
     "seed":              42,
     "verbose":           -1,
@@ -261,74 +244,83 @@ LGB_PARAMS_ZERO_V2 = {
 
 mlflow.set_experiment(MLFLOW_EXPERIMENT)
  
-with mlflow.start_run(run_name="stage1_zero_clf_v2") as run:
+with mlflow.start_run(run_name="stage1_zero_clf_v3") as run:
     mlflow.log_params({
-        **LGB_PARAMS_ZERO_V2,
-        "n_features_zero":      len(FEATURES_ZERO),
-        "zero_features_added":  ZERO_FEATURES_ADDED,
-        "train_rows":           len(train_pd),
-        "val_rows":             len(val_pd),
-        "zero_rate_train":      float(z_tr.mean()),
-        "zero_rate_val":        float(z_va.mean()),
-        "dead_pair_filtered":   True,
-        "sample_weight":        "wape_per_article",
+        **BASE_PARAMS,
+        "n_features_zero":    len(FEATURES_ZERO),
+        "train_rows":         len(train_pd),
+        "val_rows":           len(val_pd),
+        "zero_rate_train":    float(z_tr.mean()),
+        "zero_rate_val":      float(z_va.mean()),
     })
  
+    # free_raw_data=False obligatoire pour init_model en phase 2
     dtrain_z = lgb.Dataset(
-        X_tr, label=z_tr,
-        weight=w_tr,
+        X_tr, label=z_tr, weight=w_tr,
         categorical_feature=FEATURES_CATEGORICAL,
+        free_raw_data=False,
     )
     dval_z = lgb.Dataset(
-        X_va, label=z_va,
-        weight=w_va,
+        X_va, label=z_va, weight=w_va,
         reference=dtrain_z,
         categorical_feature=FEATURES_CATEGORICAL,
+        free_raw_data=False,
     )
  
-# PAR ça :
-params_phase1 = {**LGB_PARAMS_ZERO_V2, "learning_rate": 0.1}
-
-model_zero = lgb.train(
-    params_phase1,
-    dtrain_z,
-    num_boost_round=200,
-    valid_sets=[dtrain_z, dval_z],
-    valid_names=["train", "val"],
-    callbacks=[
-        lgb.log_evaluation(period=50),
-    ],
-)
-
-params_phase2 = {**LGB_PARAMS_ZERO_V2, "learning_rate": 0.005}
-
-model_zero = lgb.train(
-    params_phase2,
-    dtrain_z,
-    num_boost_round=1000,
-    init_model=model_zero,
-    valid_sets=[dtrain_z, dval_z],
-    valid_names=["train", "val"],
-    callbacks=[
-        lgb.early_stopping(stopping_rounds=150, first_metric_only=True),
-        lgb.log_evaluation(period=100),
-    ],
-)
+    # ---- Phase 1 : exploration (LR modéré, early stopping court) ----
+    print("=== Phase 1 : exploration ===")
+    params_p1 = {**BASE_PARAMS, "learning_rate": 0.05}
  
+    model_zero = lgb.train(
+        params_p1,
+        dtrain_z,
+        num_boost_round=500,
+        valid_sets=[dtrain_z, dval_z],
+        valid_names=["train", "val"],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, first_metric_only=True),
+            lgb.log_evaluation(period=50),
+        ],
+    )
+    print(f"Phase 1 terminée à l'itération {model_zero.best_iteration}")
+ 
+    # ---- Phase 2 : affinage fin (LR très bas, early stopping patient) ----
+    print("\n=== Phase 2 : affinage ===")
+    params_p2 = {**BASE_PARAMS, "learning_rate": 0.005}
+ 
+    model_zero = lgb.train(
+        params_p2,
+        dtrain_z,
+        num_boost_round=1000,
+        init_model=model_zero,
+        valid_sets=[dtrain_z, dval_z],
+        valid_names=["train", "val"],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=150, first_metric_only=True),
+            lgb.log_evaluation(period=100),
+        ],
+    )
+    print(f"Phase 2 terminée à l'itération {model_zero.best_iteration}")
     mlflow.log_param("best_iteration_zero", model_zero.best_iteration)
-    p_zero_raw = model_zero.predict(X_va, num_iteration=model_zero.best_iteration)
  
 
 # COMMAND ----------
 
-mid = len(p_zero_raw) // 2
+ p_zero_raw = model_zero.predict(X_va, num_iteration=model_zero.best_iteration)
+ 
+    mid = len(p_zero_raw) // 2
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(p_zero_raw[:mid], z_va[:mid])
-    p_zero_val = iso.transform(p_zero_raw)   # probabilités calibrées sur tout le val
+    p_zero_val = iso.transform(p_zero_raw)
+ 
+    # Vérification : la calibration ne doit pas écraser la variance
+    print(f"p_zero_raw  — mean={p_zero_raw.mean():.3f}  std={p_zero_raw.std():.3f}")
+    print(f"p_zero_cal  — mean={p_zero_val.mean():.3f}  std={p_zero_val.std():.3f}")
+ 
 
 # COMMAND ----------
 
-   auc_pr  = average_precision_score(z_va, p_zero_val)
+auc_pr  = average_precision_score(z_va, p_zero_val)
     auc_roc = roc_auc_score(z_va, p_zero_val)
     logloss = float(
         -np.mean(
@@ -336,35 +328,44 @@ mid = len(p_zero_raw) // 2
             + (1 - z_va) * np.log(np.clip(1 - p_zero_val, 1e-7, 1 - 1e-7))
         )
     )
- 
     mlflow.log_metrics({
         "val_logloss_calibrated": logloss,
         "val_auc_roc":            auc_roc,
         "val_auc_pr":             auc_pr,
     })
-    print(f"AUC-ROC={auc_roc:.4f}  AUC-PR={auc_pr:.4f}  Logloss={logloss:.4f}")
+    print(f"\nAUC-ROC={auc_roc:.4f}  AUC-PR={auc_pr:.4f}  Logloss={logloss:.4f}")
+ 
+    # Vérification overfit : le gap train/val ne doit pas dépasser ~0.05
+    p_zero_train = model_zero.predict(X_tr, num_iteration=model_zero.best_iteration)
+    logloss_train = float(
+        -np.mean(
+            z_tr * np.log(np.clip(p_zero_train, 1e-7, 1 - 1e-7))
+            + (1 - z_tr) * np.log(np.clip(1 - p_zero_train, 1e-7, 1 - 1e-7))
+        )
+    )
+    gap = logloss - logloss_train
+    mlflow.log_metric("overfit_gap_logloss", gap)
+    print(f"Logloss train={logloss_train:.4f}  val={logloss:.4f}  gap={gap:.4f}")
+    if gap > 0.1:
+        print("[WARN] Gap train/val > 0.1 — considérer augmenter min_child_samples ou reg_lambda")
 
 # COMMAND ----------
 
- try:
-        # Vérification que model_qty est disponible dans le scope
+try:
         _ = model_qty
-        qty_pred_raw = model_qty.predict(X_va, num_iteration=model_qty.best_iteration)
-        qty_pred     = np.clip(qty_pred_raw, 0.0, None)
+        qty_pred = np.clip(
+            model_qty.predict(X_va, num_iteration=model_qty.best_iteration), 0.0, None
+        )
  
-        # Segmentation par volume article (terciles)
         vol_q33 = val_pd["art_vol"].quantile(0.33)
         vol_q66 = val_pd["art_vol"].quantile(0.66)
+        val_pd["vol_segment"] = pd.cut(
+            val_pd["art_vol"],
+            bins=[-np.inf, vol_q33, vol_q66, np.inf],
+            labels=["low", "medium", "high"],
+        )
  
-        def segment(v):
-            if v <= vol_q33:   return "low"
-            elif v <= vol_q66: return "medium"
-            else:               return "high"
- 
-        val_pd["vol_segment"] = val_pd["art_vol"].apply(segment)
- 
-        best_thresholds = {}
-        rows_seg = []
+        best_thresholds, rows_seg = {}, []
         for seg in ["low", "medium", "high"]:
             mask    = val_pd["vol_segment"].values == seg
             p_seg   = p_zero_val[mask]
@@ -372,7 +373,7 @@ mid = len(p_zero_raw) // 2
             y_seg   = y_va[mask]
  
             best_thr, best_w = 0.5, float("inf")
-            for thr in np.arange(0.1, 0.95, 0.025):
+            for thr in np.arange(0.05, 0.95, 0.025):
                 final = np.where(p_seg > thr, 0.0, qty_seg)
                 w     = wape_numpy(y_seg, final)
                 rows_seg.append({"segment": seg, "threshold": thr, "wape": w})
@@ -381,84 +382,78 @@ mid = len(p_zero_raw) // 2
             best_thresholds[seg] = best_thr
             print(f"  [{seg:6s}]  threshold={best_thr:.3f}  WAPE={best_w:.4f}")
  
-        pd.DataFrame(rows_seg).to_csv("/tmp/threshold_sweep_seg.csv", index=False)
-        mlflow.log_artifact("/tmp/threshold_sweep_seg.csv")
+        pd.DataFrame(rows_seg).to_csv("/tmp/threshold_sweep_v3.csv", index=False)
+        mlflow.log_artifact("/tmp/threshold_sweep_v3.csv")
         mlflow.log_params({f"threshold_{k}": v for k, v in best_thresholds.items()})
  
     except NameError:
         print("[INFO] model_qty non disponible — threshold sweep à faire après Stage 2.")
         best_thresholds = {"low": 0.5, "medium": 0.5, "high": 0.5}
  
-    # COMMAND ----------
+
+# COMMAND ----------
+
+ results = model_zero.evals_result()
+    if "train" in results and "val" in results:
+        iters       = range(len(results["train"]["binary_logloss"]))
+        train_loss  = results["train"]["binary_logloss"]
+        val_loss    = results["val"]["binary_logloss"]
  
-    # MAGIC %md
-    # MAGIC ## 9. Diagnostic : PR-curve + Confusion Matrix + SHAP
- 
-    # COMMAND ----------
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        axes[0].plot(iters, train_loss, label="Train")
+        axes[0].plot(iters, val_loss,   label="Val")
+        axes[0].axvline(model_zero.best_iteration, color="red", linestyle="--", label="Best iter")
+        axes[0].set_xlabel("Iteration"); axes[0].set_ylabel("Logloss")
+        axes[0].set_title("Train vs Val Logloss"); axes[0].legend(); axes[0].grid(alpha=0.3)
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
  
     # --- PR Curve ---
-    precision, recall, pr_thr = precision_recall_curve(z_va, p_zero_val)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    precision, recall, _ = precision_recall_curve(z_va, p_zero_val)
+    axes[1].plot(recall, precision, lw=2)
+    axes[1].set_xlabel("Recall"); axes[1].set_ylabel("Precision")
+    axes[1].set_title(f"PR Curve (AUC-PR={auc_pr:.3f})")
+    axes[1].set_xlim([0, 1]); axes[1].set_ylim([0, 1]); axes[1].grid(alpha=0.3)
  
-    axes[0].plot(recall, precision, lw=2)
-    axes[0].set_xlabel("Recall")
-    axes[0].set_ylabel("Precision")
-    axes[0].set_title(f"PR Curve (AUC-PR={auc_pr:.3f})")
-    axes[0].set_xlim([0, 1]); axes[0].set_ylim([0, 1])
-    axes[0].grid(alpha=0.3)
- 
-    # Confusion matrix au threshold 0.5 (calibré)
-    pred_bin = (p_zero_val > 0.5).astype(int)
-    cm       = confusion_matrix(z_va, pred_bin)
-    im       = axes[1].imshow(cm, cmap="Blues")
-    axes[1].set_xticks([0, 1]); axes[1].set_yticks([0, 1])
-    axes[1].set_xticklabels(["Prédit non-zéro", "Prédit zéro"])
-    axes[1].set_yticklabels(["Réel non-zéro", "Réel zéro"])
-    axes[1].set_title("Confusion Matrix (thr=0.5)")
-    for i in range(2):
-        for j in range(2):
-            axes[1].text(j, i, f"{cm[i,j]:,}", ha="center", va="center",
-                         color="white" if cm[i,j] > cm.max()/2 else "black")
     plt.tight_layout()
-    fig.savefig("/tmp/zero_clf_diagnostics.png", dpi=120, bbox_inches="tight")
+    fig.savefig("/tmp/zero_clf_v3_curves.png", dpi=120, bbox_inches="tight")
     plt.close(fig)
-    mlflow.log_artifact("/tmp/zero_clf_diagnostics.png")
+    mlflow.log_artifact("/tmp/zero_clf_v3_curves.png")
  
     # --- SHAP ---
     try:
-        sample_idx = np.random.choice(len(X_va), size=min(3000, len(X_va)), replace=False)
-        X_shap = X_va.iloc[sample_idx].copy()
+        idx    = np.random.choice(len(X_va), size=min(3000, len(X_va)), replace=False)
+        X_shap = X_va.iloc[idx].copy()
         for c in FEATURES_CATEGORICAL:
             if c in X_shap.columns:
                 X_shap[c] = X_shap[c].astype(float)
  
         explainer   = shap.TreeExplainer(model_zero)
         shap_values = explainer.shap_values(X_shap)
+        sv          = shap_values[1] if isinstance(shap_values, list) else shap_values
  
-        # summary_plot retourne une liste [class0, class1] pour binary
-        sv = shap_values[1] if isinstance(shap_values, list) else shap_values
         fig, ax = plt.subplots(figsize=(10, 8))
         shap.summary_plot(sv, X_shap, show=False, max_display=25)
-        fig.savefig("/tmp/shap_zero_clf.png", bbox_inches="tight", dpi=120)
+        fig.savefig("/tmp/shap_zero_v3.png", bbox_inches="tight", dpi=120)
         plt.close(fig)
-        mlflow.log_artifact("/tmp/shap_zero_clf.png")
+        mlflow.log_artifact("/tmp/shap_zero_v3.png")
  
-        # Top features SHAP (mean |SHAP|)
         shap_df = pd.DataFrame({
-            "feature":    X_shap.columns,
-            "mean_shap":  np.abs(sv).mean(axis=0),
+            "feature":   X_shap.columns,
+            "mean_shap": np.abs(sv).mean(axis=0),
         }).sort_values("mean_shap", ascending=False)
-        shap_df.to_csv("/tmp/shap_zero_importance.csv", index=False)
-        mlflow.log_artifact("/tmp/shap_zero_importance.csv")
+        shap_df.to_csv("/tmp/shap_zero_v3_importance.csv", index=False)
+        mlflow.log_artifact("/tmp/shap_zero_v3_importance.csv")
         print("\nTop 10 features (SHAP) :")
         print(shap_df.head(10).to_string(index=False))
  
     except Exception as e:
         print(f"[WARN] SHAP skipped: {e}")
+ 
 
 # COMMAND ----------
 
-X_tr_clean = X_tr.head(5).copy()
+ X_tr_clean = X_tr.head(5).copy()
     for c in FEATURES_CATEGORICAL:
         if c in X_tr_clean.columns:
             X_tr_clean[c] = X_tr_clean[c].astype(int)
@@ -466,23 +461,23 @@ X_tr_clean = X_tr.head(5).copy()
     sig_zero = infer_signature(X_tr_clean, model_zero.predict(X_tr.head(5)))
     mlflow.lightgbm.log_model(
         model_zero,
-        artifact_path="zero_classifier_v2",
+        artifact_path="zero_classifier_v3",
         registered_model_name=MLFLOW_MODEL_NAME_ZERO,
         signature=sig_zero,
         input_example=X_tr_clean.head(1),
     )
  
-    # Feature importance gain (en complément de SHAP)
     fi_zero = pd.DataFrame({
         "feature": FEATURES_ZERO,
         "gain":    model_zero.feature_importance(importance_type="gain"),
         "split":   model_zero.feature_importance(importance_type="split"),
     }).sort_values("gain", ascending=False)
-    fi_zero.to_csv("/tmp/fi_zero_v2.csv", index=False)
-    mlflow.log_artifact("/tmp/fi_zero_v2.csv")
+    fi_zero.to_csv("/tmp/fi_zero_v3.csv", index=False)
+    mlflow.log_artifact("/tmp/fi_zero_v3.csv")
  
-    print(f"\n✅ Classifieur zéro v2 entraîné et loggé.")
+    print(f"\n✅ Zero classifier v3")
     print(f"   AUC-ROC : {auc_roc:.4f}")
     print(f"   AUC-PR  : {auc_pr:.4f}")
     print(f"   Logloss : {logloss:.4f}")
-    print(f"   Thresholds WAPE : {best_thresholds}")
+    print(f"   Gap overfit : {gap:.4f}")
+ 
